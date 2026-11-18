@@ -1,131 +1,102 @@
-// HUD + minimap + menus. Every number here is read live from the game state —
-// cash, health, ammo, speed, wanted stars, turf, clock — never a staged value.
-// The minimap is a real 2D canvas: districts, roads, the player, cops, gang and
-// the mission marker, all drawn from live positions every frame.
-import { DISTRICTS, SIDE, WORLD } from './config.js';
+// MARISOL BAY — hud.js
+// One job: everything drawn on top of the 3D view. Cash, health, ammo,
+// wanted stars, turf chips, the mission objective line, the speedo,
+// the live minimap (real positions, recomputed every frame), the start
+// screen, the pause menu and the damage flash. Every number here is
+// read from the live game state — nothing is staged.
+import { DISTRICTS, CFG } from './config.js';
 
 export function createHud(G) {
   const $ = (id) => document.getElementById(id);
-  const els = {
-    hud: $('hud'), cash: $('cash'), stars: $('stars'), hpFill: $('hp-fill'), hpText: $('hp-text'),
-    ammo: $('ammo'), speed: $('speed'), turf: $('turf'), clock: $('clock'),
-    objective: $('objective'), toast: $('toast'), minimap: $('minimap'),
-    menu: $('menu'), pause: $('pause'), busted: $('busted'), wasted: $('wasted'),
-    flash: $('damage-flash'), district: $('district'),
+  const H = {
+    objective: 'Free roam — press M for the next mission',
+    flashTimer: 0,
   };
-  const mm = els.minimap.getContext('2d');
-  let toastTimer = null;
-  const hud = {
-    toast(msg) {
-      els.toast.textContent = msg;
-      els.toast.classList.add('show');
-      clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => els.toast.classList.remove('show'), 3200);
-    },
-    flashDamage() {
-      els.flash.style.opacity = '0.45';
-      setTimeout(() => { els.flash.style.opacity = '0'; }, 130);
-    },
-    show(name) {
-      for (const k of ['menu', 'pause', 'busted', 'wasted']) els[k].classList.toggle('hidden', k !== name);
-      els.hud.classList.toggle('hidden', name === 'menu');
-    },
-    hideAll() { for (const k of ['menu', 'pause', 'busted', 'wasted']) els[k].classList.add('hidden'); els.hud.classList.remove('hidden'); },
-    update() {
-      const s = G.state;
-      els.cash.textContent = '$' + Math.floor(s.cash).toLocaleString('en-US');
-      els.stars.textContent = '★'.repeat(s.wanted) + '☆'.repeat(5 - s.wanted);
-      els.stars.style.color = s.wanted > 0 ? '#ffd23a' : '#5a6270';
-      const hp = Math.max(0, Math.round(G.player.hp));
-      els.hpFill.style.width = hp + '%';
-      els.hpFill.style.background = hp > 50 ? '#37c978' : hp > 25 ? '#f2a541' : '#e05d5d';
-      els.hpText.textContent = hp;
-      els.ammo.textContent = G.combat.ammo + ' / ' + 12 + (G.combat.reloading > 0 ? ' …' : '');
-      const car = G.vehicles.driven;
-      els.speed.textContent = car ? Math.round(Math.abs(car.speed) * 3.6) + ' km/h · ' + car.cfg.name : 'on foot';
-      const taken = s.turf.filter(Boolean).length;
-      els.turf.textContent = 'TURF ' + taken + '/6';
-      const t = G.world.timeOfDay;
-      const hh = Math.floor(t * 24), mmn = Math.floor((t * 24 - hh) * 60);
-      const tod = t > 0.92 || t < 0.08 ? 'NIGHT' : t > 0.78 ? 'DUSK' : 'DAY';
-      els.clock.textContent = String(hh).padStart(2, '0') + ':' + String(mmn).padStart(2, '0') + ' ' + tod;
-      els.objective.textContent = G.missions.objective();
-      const here = DISTRICTS.find((dd) => G.player.x >= dd.x0 && G.player.x < dd.x1 && G.player.z >= dd.z0 && G.player.z < dd.z1);
-      els.district.textContent = here ? here.name.toUpperCase() : 'MARISOL BAY';
-      els.district.style.color = here ? '#' + here.color.toString(16).padStart(6, '0') : '#fff';
-      this.drawMinimap();
-    },
-    drawMinimap() {
-      const S = 180, scale = S / WORLD.SIZE;
-      const toX = (x) => (x + WORLD.HALF) * scale;
-      const toY = (z) => (z + WORLD.HALF) * scale;
-      mm.clearRect(0, 0, S, S);
-      mm.fillStyle = '#10141a'; mm.fillRect(0, 0, S, S);
-      // Sea + sand on the west edge.
-      mm.fillStyle = '#1f7fa8'; mm.fillRect(0, 0, (WORLD.WATER_X + 30 + WORLD.HALF) * scale + 14, S);
-      mm.fillStyle = '#e8d29a'; mm.fillRect(toX(WORLD.SAND_X0), 0, (WORLD.SAND_X1 - WORLD.SAND_X0) * scale, S);
-      // Districts.
-      for (const d of DISTRICTS) {
-        mm.fillStyle = '#' + d.color.toString(16).padStart(6, '0') + '55';
-        mm.fillRect(toX(d.x0), toY(d.z0), (d.x1 - d.x0) * scale, (d.z1 - d.z0) * scale);
-        mm.strokeStyle = '#' + d.color.toString(16).padStart(6, '0');
-        mm.lineWidth = G.state.turf[d.id] ? 2.5 : 1;
-        mm.strokeRect(toX(d.x0), toY(d.z0), (d.x1 - d.x0) * scale, (d.z1 - d.z0) * scale);
-        if (G.state.turf[d.id]) {
-          mm.fillStyle = '#fff'; mm.font = 'bold 11px sans-serif'; mm.textAlign = 'center';
-          mm.fillText('✓', toX(d.cx), toY(d.cz) + 4);
-        }
-      }
-      // Roads.
-      mm.strokeStyle = '#5a6270'; mm.lineWidth = 1;
-      for (let v = -240; v <= 240; v += 40) {
-        mm.beginPath(); mm.moveTo(toX(v), 0); mm.lineTo(toX(v), S); mm.stroke();
-        mm.beginPath(); mm.moveTo(0, toY(v)); mm.lineTo(S, toY(v)); mm.stroke();
-      }
-      // Cars (grey), gang (red), cops (blue).
-      const dot = (x, z, c, r) => { mm.fillStyle = c; mm.beginPath(); mm.arc(toX(x), toY(z), r, 0, 7); mm.fill(); };
-      for (const c of G.vehicles.list) {
-        if (c.driver === 'police') dot(c.group.position.x, c.group.position.z, '#3a86ff', 3);
-        else if (c.driver === 'player') continue;
-        else dot(c.group.position.x, c.group.position.z, '#9aa5ad', 2);
-      }
-      for (const e of G.combat.enemies) dot(e.x, e.z, '#ff4040', 2.5);
-      for (const c of G.police.footCops) dot(c.x, c.z, '#3a86ff', 2.5);
-      // Mission marker: pulsing yellow diamond.
-      const mp = G.missions.markerPos();
-      if (mp) {
-        const pulse = 4 + Math.sin(performance.now() / 200) * 1.5;
-        mm.fillStyle = '#ffd23a';
-        mm.beginPath();
-        mm.moveTo(toX(mp.x), toY(mp.z) - pulse - 3);
-        mm.lineTo(toX(mp.x) + pulse + 3, toY(mp.z));
-        mm.lineTo(toX(mp.x), toY(mp.z) + pulse + 3);
-        mm.lineTo(toX(mp.x) - pulse - 3, toY(mp.z));
-        mm.closePath(); mm.fill();
-      }
-      // Player: white triangle pointing along the facing yaw.
-      const px = toX(G.player.x), pz = toY(G.player.z);
-      const yaw = G.player.inCar && G.player.car ? G.player.car.yaw : G.player.yaw;
-      mm.save();
-      mm.translate(px, pz); mm.rotate(Math.PI - yaw);
-      mm.fillStyle = '#fff';
-      mm.beginPath(); mm.moveTo(0, -7); mm.lineTo(5, 5); mm.lineTo(-5, 5); mm.closePath(); mm.fill();
-      mm.restore();
-      mm.strokeStyle = 'rgba(255,255,255,0.35)'; mm.lineWidth = 1;
-      mm.strokeRect(0.5, 0.5, S - 1, S - 1);
-    },
+  H.setObjective = (t) => { H.objective = t; const el = $('objective'); if (el) el.textContent = t; };
+  H.flash = (t) => {
+    const el = $('toast'); if (!el) return;
+    el.textContent = t; el.style.opacity = '1'; H.flashTimer = 3.2;
   };
-  // Buttons.
-  $('start-btn').addEventListener('click', () => G.startGame());
-  $('resume-btn').addEventListener('click', () => G.setMode('playing'));
-  $('restart-btn').addEventListener('click', () => {
-    G.player.reset(-100, -160);
-    G.player.hp = 100;
-    G.setMode('playing');
-  });
-  $('mute-btn').addEventListener('click', (e) => {
-    G.audio.setMuted(!G.audio.muted);
-    e.target.textContent = G.audio.muted ? '🔇 Sound: off' : '🔊 Sound: on';
-  });
-  return hud;
+  H.damageFlash = () => { const el = $('damage'); if (el) { el.style.opacity = '0.55'; setTimeout(() => { el.style.opacity = '0'; }, 160); } };
+  H.showMenu = (show) => { const el = $('menu'); if (el) el.style.display = show ? 'flex' : 'none'; };
+  H.showPause = (show) => { const el = $('pause'); if (el) el.style.display = show ? 'flex' : 'none'; };
+  H.showStart = (show) => { const el = $('start'); if (el) el.style.display = show ? 'flex' : 'none'; };
+
+  // Build the turf chips once; their colours update every frame.
+  const turfEl = $('turf');
+  if (turfEl) {
+    turfEl.innerHTML = DISTRICTS.map((d, i) =>
+      `<span id="turf-${i}" style="background:#222a; border:1px solid #${d.color.toString(16).padStart(6, '0')}; color:#fff; padding:2px 7px; border-radius:10px; font-size:11px; margin-right:4px;">${d.name}</span>`).join('');
+  }
+
+  H.update = (dt) => {
+    if (H.flashTimer > 0) { H.flashTimer -= dt; if (H.flashTimer <= 0) { const el = $('toast'); if (el) el.style.opacity = '0'; } }
+    const cash = $('cash'); if (cash) cash.textContent = `$${Math.round(G.cash).toLocaleString('en-US')}`;
+    const hp = $('health'); if (hp) { hp.textContent = `♥ ${Math.max(0, Math.round(G.player.health))}`; hp.style.color = G.player.health < 30 ? '#ff5d5d' : '#7dff6a'; }
+    const ammo = $('ammo'); if (ammo) ammo.textContent = G.player.armed ? `🔫 ${G.player.ammo}` : '👊 FISTS';
+    const stars = $('stars'); if (stars) { stars.textContent = '★'.repeat(G.wanted) + '☆'.repeat(CFG.maxWanted - G.wanted); stars.style.color = G.wanted > 0 ? '#ffd23e' : '#ffffff88'; }
+    const turfCount = $('turfcount'); if (turfCount) turfCount.textContent = `TURF ${G.turf.filter(Boolean).length}/6`;
+    for (let i = 0; i < 6; i++) {
+      const chip = $(`turf-${i}`);
+      if (chip) chip.style.background = G.turf[i] ? `#${DISTRICTS[i].color.toString(16).padStart(6, '0')}` : '#222a';
+    }
+    const speed = $('speed');
+    if (speed) {
+      speed.textContent = G.player.car ? `${Math.round(Math.abs(G.player.car.speed) * 3.6)} km/h · ${G.player.car.def.name}` : (G.player.onFoot ? 'ON FOOT' : '');
+    }
+    const clockEl = $('clock');
+    if (clockEl) {
+      const h = Math.floor(6 + G.timeOfDay * 24) % 24;
+      const m = Math.floor((G.timeOfDay * 24 * 60) % 60);
+      clockEl.textContent = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} · ${G.timeOfDay < 0.5 ? 'DAY' : G.timeOfDay < 0.72 ? 'DUSK' : 'NIGHT'}`;
+    }
+    const mis = $('mission-label');
+    if (mis) mis.textContent = G.missionsDone.filter(Boolean).length >= 7 ? '🏆 KING OF THE BAY'
+      : (G.missionIndex < 7 ? `MISSION ${G.missionIndex + 1}/7` : 'FREE ROAM');
+    H.drawMinimap();
+  };
+
+  // Minimap: roads, district beacons, cars, cops, mission marker, Milo.
+  H.drawMinimap = () => {
+    const cv = $('minimap');
+    if (!cv) return;
+    const ctx = cv.getContext('2d');
+    const S = cv.width, half = CFG.citySize / 2;
+    const px = (x) => ((x + half) / CFG.citySize) * S;
+    const pz = (z) => ((z + half) / CFG.citySize) * S;
+    ctx.fillStyle = '#101820'; ctx.fillRect(0, 0, S, S);
+    ctx.fillStyle = '#ffe9a8'; ctx.fillRect(0, pz(half + 8), S, S - pz(half + 8)); // beach strip
+    ctx.fillStyle = '#2ec8d8'; ctx.fillRect(0, pz(half + 40), S, 4);
+    ctx.strokeStyle = '#5a6470'; ctx.lineWidth = 4;
+    for (const c of G.world.roads) {
+      ctx.beginPath(); ctx.moveTo(px(-half), pz(c)); ctx.lineTo(px(half), pz(c)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(px(c), pz(-half)); ctx.lineTo(px(c), pz(half)); ctx.stroke();
+    }
+    for (const d of DISTRICTS) {
+      ctx.fillStyle = `#${d.color.toString(16).padStart(6, '0')}`;
+      ctx.globalAlpha = G.turf[d.id] ? 1 : 0.45;
+      ctx.beginPath(); ctx.arc(px(d.cx), pz(d.cz), 7, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = '#ffd23e';
+    for (const c of G.world.collectibles) if (!c.taken) ctx.fillRect(px(c.x) - 1, pz(c.z) - 1, 2, 2);
+    ctx.fillStyle = '#ffffff';
+    for (const c of G.traffic.cars) ctx.fillRect(px(c.pos.x) - 1.5, pz(c.pos.z) - 1.5, 3, 3);
+    ctx.fillStyle = '#ff3b30';
+    for (const c of G.police.cars) { ctx.beginPath(); ctx.arc(px(c.pos.x), pz(c.pos.z), 3, 0, Math.PI * 2); ctx.fill(); }
+    for (const c of G.police.cops) ctx.fillRect(px(c.pos.x) - 2, pz(c.pos.z) - 2, 4, 4);
+    if (G.missions.current) {
+      const d = G.missions.current.district;
+      ctx.strokeStyle = '#ffd23e'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px(d.cx), pz(d.cz), 10 + Math.sin(G.time * 4) * 3, 0, Math.PI * 2); ctx.stroke();
+    }
+    // Milo: a white arrow that turns with him
+    const p = G.player.pos;
+    ctx.save();
+    ctx.translate(px(p.x), pz(p.z)); ctx.rotate(Math.atan2(Math.sin(G.player.angle), Math.cos(G.player.angle)));
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.moveTo(0, -7); ctx.lineTo(5, 6); ctx.lineTo(-5, 6); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  };
+  return H;
 }

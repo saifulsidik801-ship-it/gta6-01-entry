@@ -1,118 +1,137 @@
-// Milo Kade on foot: third-person movement, run, jump, and getting in and out
-// of cars. Driving itself lives in vehicle.js; this module only moves the body.
-import * as THREE from '../vendor/three.module.min.js';
-import { PLAYER } from './config.js';
-import { collideCircle } from './world.js';
-import { clamp, angleLerp } from './random.js';
-
-function makeHumanoid(shirt, pants, skin) {
-  const g = new THREE.Group();
-  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.72, 0.34), mat(shirt));
-  torso.position.y = 1.12; g.add(torso);
-  const head = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.34, 0.32), mat(skin));
-  head.position.y = 1.68; g.add(head);
-  const cap = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.1, 0.36), mat(0x1e3a5f));
-  cap.position.y = 1.88; g.add(cap);
-  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.72, 0.26), mat(pants));
-  legL.position.set(-0.16, 0.36, 0); g.add(legL);
-  const legR = legL.clone(); legR.position.x = 0.16; g.add(legR);
-  const armL = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.62, 0.22), mat(shirt));
-  armL.position.set(-0.42, 1.12, 0); g.add(armL);
-  const armR = armL.clone(); armR.position.x = 0.42; g.add(armR);
-  g.userData = { legL, legR, armL, armR, torso };
-  return g;
-}
+// MARISOL BAY — player.js
+// One job: Milo Kade on foot. WASD movement with a run key, simple
+// animated limbs, entering/exiting cars with E, punching with F, and
+// the health/busted/wasted states that the police module drives.
+import * as THREE from 'three';
+import { clamp } from './random.js';
+import { hitsBuilding } from './world.js';
+import { CFG } from './config.js';
 
 export function createPlayer(G) {
-  const group = makeHumanoid(0x1e8a7a, 0x2c2f36, 0xd9a066);
-  group.position.set(-100, 0, -160);
-  G.scene.add(group);
-  const player = {
-    group, yaw: 0, vy: 0, grounded: true, hp: PLAYER.HP, inCar: false, car: null,
-    walkPhase: 0, speed: 0, punchTimer: 0,
-    get x() { return group.position.x; },
-    get z() { return group.position.z; },
-    reset(x, z) {
-      group.position.set(x, 0, z); this.yaw = 0; this.hp = PLAYER.HP;
-      this.inCar = false; this.car = null; group.visible = true;
-    },
-    takeDamage(n) {
-      this.hp = Math.max(0, this.hp - n);
-      G.hud.flashDamage();
-      if (this.hp <= 0) G.setMode('wasted');
-    },
-    heal(n) { this.hp = Math.min(PLAYER.HP, this.hp + n); },
+  const g = new THREE.Group();
+  const skin = new THREE.MeshLambertMaterial({ color: 0xe8b98a });
+  const shirt = new THREE.MeshLambertMaterial({ color: 0xff5d7e }); // bright coral tee, readable at distance
+  const pants = new THREE.MeshLambertMaterial({ color: 0x2b3a55 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.85, 1.0, 0.45), shirt);
+  body.position.y = 1.25; body.castShadow = true; g.add(body);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.5), skin);
+  head.position.y = 2.05; head.castShadow = true; g.add(head);
+  const cap = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.18, 0.55), new THREE.MeshLambertMaterial({ color: 0xffd23e }));
+  cap.position.y = 2.36; g.add(cap);
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.85, 0.36), pants);
+  legL.position.set(-0.22, 0.45, 0); g.add(legL);
+  const legR = legL.clone(); legR.position.x = 0.22; g.add(legR);
+  const armL = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.8, 0.3), shirt);
+  armL.position.set(-0.58, 1.3, 0); g.add(armL);
+  const armR = armL.clone(); armR.position.x = 0.58; g.add(armR);
+  // a simple pistol in the right hand when armed
+  const gun = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.16, 0.55), new THREE.MeshLambertMaterial({ color: 0x14181d }));
+  gun.position.set(0.58, 0.95, 0.3); gun.visible = false; g.add(gun);
+  g.position.set(0, 0, 24);
+  G.scene.add(g);
+  const P = {
+    mesh: g, pos: g.position, angle: Math.PI, speed: 0, health: CFG.startHealth,
+    onFoot: true, car: null, armed: false, ammo: 24, punchCooldown: 0,
+    walkPhase: 0, legL, legR, armL, armR, gun, busted: false, wasted: false,
+    respawnTimer: 0,
   };
-
-  player.update = (dt) => {
-    if (player.inCar || G.state.mode !== 'playing') return;
-    const input = G.input;
-    const run = input.down('ShiftLeft') || input.down('ShiftRight');
-    const speed = run ? PLAYER.RUN : PLAYER.WALK;
-    const mx = input.axisX(), mz = input.axisY();
-    // Movement is relative to the camera yaw, so W always runs away from the camera.
-    // Camera forward is (sin yaw, cos yaw); screen-right is (-cos yaw, sin yaw).
-    const camYaw = G.cameraRig.yaw;
-    const sin = Math.sin(camYaw), cos = Math.cos(camYaw);
-    let dx = mz * sin - mx * cos, dz = mz * cos + mx * sin;
-    const len = Math.hypot(dx, dz);
-    if (len > 0.01) {
-      dx /= len; dz /= len;
-      const targetYaw = Math.atan2(dx, dz);
-      player.yaw = angleLerp(player.yaw, targetYaw, dt * 12);
-      group.rotation.y = player.yaw;
-      let nx = group.position.x + dx * speed * dt;
-      let nz = group.position.z + dz * speed * dt;
-      const hit = collideCircle(G.world, nx, nz, PLAYER.RADIUS);
-      group.position.x = hit.x; group.position.z = hit.z;
-      player.speed = speed;
-      player.walkPhase += dt * speed * 1.6;
-    } else {
-      player.speed = 0;
-      player.walkPhase += dt * 2;
-    }
-    // Jump.
-    if (input.pressed('Space') && player.grounded) { player.vy = PLAYER.JUMP; player.grounded = false; }
-    if (!player.grounded) {
-      player.vy -= 22 * dt;
-      group.position.y += player.vy * dt;
-      if (group.position.y <= 0) { group.position.y = 0; player.vy = 0; player.grounded = true; }
-    }
-    // Walk-cycle swing, eased out when idle.
-    const amp = clamp(player.speed / PLAYER.RUN, 0, 1) * 0.55;
-    const s = Math.sin(player.walkPhase);
-    const u = group.userData;
-    u.legL.rotation.x = s * amp; u.legR.rotation.x = -s * amp;
-    u.armL.rotation.x = -s * amp * 0.8; u.armR.rotation.x = s * amp * 0.8;
-    if (player.punchTimer > 0) {
-      player.punchTimer -= dt;
-      u.armR.rotation.x = -1.9 * clamp(player.punchTimer / PLAYER.PUNCH_CD, 0, 1);
-    }
-    // Slow health regen when calm.
-    if (G.state.wanted === 0 && player.hp < PLAYER.HP) player.hp = Math.min(PLAYER.HP, player.hp + 2 * dt);
-  };
-
-  // Nearest car the player could get into (parked, traffic or abandoned).
-  player.nearestCar = (maxD) => {
-    let best = null, bd = maxD || 3.5;
-    for (const car of G.vehicles.list) {
-      if (car.driver === 'player' || car.wrecked) continue;
-      const d = Math.hypot(car.group.position.x - group.position.x, car.group.position.z - group.position.z);
-      if (d < bd) { bd = d; best = car; }
-    }
-    return best;
-  };
-
-  player.tryEnterExit = () => {
-    if (player.inCar) { G.vehicles.exitCar(); return; }
-    const car = player.nearestCar(3.5);
-    if (car) G.vehicles.enterCar(car);
-  };
-  return player;
+  return P;
 }
 
-// A generic humanoid (pedestrians, gang, cops) — same build, different shirt.
-export function makePedestrian(shirt, pants) {
-  return makeHumanoid(shirt, pants, 0xd9a066);
+export function updatePlayer(G, dt) {
+  const P = G.player, input = G.input;
+  P.punchCooldown = Math.max(0, P.punchCooldown - dt);
+  if (P.busted || P.wasted) {
+    P.respawnTimer -= dt;
+    if (P.respawnTimer <= 0) respawnPlayer(G);
+    return;
+  }
+  if (!P.onFoot) return; // driving is handled by vehicle.js
+  const ax = input.axis();
+  const running = input.keys.ShiftLeft || input.keys.ShiftRight;
+  const speed = running ? 9 : 5.2;
+  // Movement is camera-relative so WASD always feels right.
+  const camYaw = G.cameraRig.yaw;
+  let mx = 0, mz = 0;
+  if (ax.y !== 0 || ax.x !== 0) {
+    const fwd = { x: -Math.sin(camYaw), z: -Math.cos(camYaw) };
+    const right = { x: -fwd.z, z: fwd.x };
+    mx = fwd.x * ax.y + right.x * ax.x;
+    mz = fwd.z * ax.y + right.z * ax.x;
+    const len = Math.hypot(mx, mz) || 1;
+    mx /= len; mz /= len;
+    P.angle = Math.atan2(mx, mz);
+    P.speed = speed;
+    P.walkPhase += dt * (running ? 13 : 9);
+  } else {
+    P.speed = 0;
+  }
+  const nx = P.pos.x + mx * P.speed * dt;
+  const nz = P.pos.z + mz * P.speed * dt;
+  const half = CFG.citySize / 2 + 30;
+  if (!hitsBuilding(G.world, nx, P.pos.z, 0.7)) P.pos.x = clamp(nx, -half, half);
+  if (!hitsBuilding(G.world, P.pos.x, nz, 0.7)) P.pos.z = clamp(nz, -half - 10, half + 44);
+  // beach splash
+  if (P.pos.z > CFG.citySize / 2 + 22 && Math.abs(P.speed) > 0.5 && Math.random() < 0.25) {
+    G.effects.splash(P.pos.x, 0.3, P.pos.z);
+  }
+  P.mesh.position.copy(P.pos);
+  P.mesh.rotation.y = P.angle;
+  const swing = P.speed > 0 ? Math.sin(P.walkPhase) * 0.55 : 0;
+  P.legL.rotation.x = swing; P.legR.rotation.x = -swing;
+  P.armL.rotation.x = -swing * 0.8; P.armR.rotation.x = swing * 0.8;
+  P.gun.visible = P.armed;
+
+  // Q: toggle pistol. F: punch. (E enter/exit lives in main.js so one
+  // held press can never enter and exit the car on the same frame.)
+  if (input.pressed('KeyQ')) { P.armed = !P.armed; G.audio.blip(P.armed ? 700 : 400, 0.08, 'square', 0.15); }
+  if (input.keys.KeyF && P.punchCooldown <= 0) {
+    P.punchCooldown = 0.45;
+    G.combat.punch(G);
+  }
+}
+
+export function enterCar(G, car) {
+  const P = G.player;
+  P.onFoot = false; P.car = car; car.parked = false; car.driver = P;
+  P.mesh.visible = false;
+  G.audio.horn();
+  G.hud.flash(`Got the ${car.def.name} — drive!`);
+  if (car.type === 'police') { G.wanted = Math.max(G.wanted, 2); G.hud.flash('You stole a patrol car! Heat +2'); }
+  else if (G.missionIndex === 0 && G.missions.current && G.missions.current.stage === 0) G.missions.advance(G);
+}
+
+export function exitCar(G) {
+  const P = G.player;
+  if (!P.car) return;
+  const car = P.car;
+  car.parked = true; car.driver = null;
+  const side = { x: car.pos.x + Math.cos(car.angle) * 2.2, z: car.pos.z - Math.sin(car.angle) * 2.2 };
+  P.pos.set(side.x, 0, side.z);
+  P.onFoot = true; P.car = null; P.mesh.visible = true;
+  P.mesh.position.copy(P.pos);
+}
+
+export function damagePlayer(G, amount, cause) {
+  const P = G.player;
+  if (P.busted || P.wasted) return;
+  P.health -= amount;
+  G.hud.damageFlash();
+  if (P.health <= 0) {
+    P.health = 0;
+    if (cause === 'busted') { P.busted = true; P.respawnTimer = 2.5; G.audio.busted(); G.hud.flash('BUSTED — the cops took $200'); G.cash = Math.max(0, G.cash - 200); }
+    else { P.wasted = true; P.respawnTimer = 2.5; G.audio.busted(); G.hud.flash('WASTED — Milo is back on his feet'); G.cash = Math.max(0, G.cash - 100); }
+    if (P.car) { P.car.parked = true; P.car.driver = null; P.car = null; }
+    P.mesh.visible = true; P.onFoot = true;
+  }
+}
+
+function respawnPlayer(G) {
+  const P = G.player;
+  P.busted = false; P.wasted = false;
+  P.health = CFG.startHealth;
+  G.wanted = 0;
+  P.pos.set(0, 0, 24); P.mesh.position.copy(P.pos);
+  P.mesh.visible = true; P.onFoot = true; P.car = null;
+  G.hud.flash('Back on the streets of Marisol Bay');
 }

@@ -1,57 +1,35 @@
-// Third-person follow camera: behind Milo on foot, behind the car while driving,
-// slow orbit over the city on the menu. Drag the mouse to look around; in a car
-// the camera settles behind the car's heading.
-import * as THREE from '../vendor/three.module.min.js';
-import { clamp, angleLerp } from './random.js';
+// MARISOL BAY — camera.js
+// One job: the third-person chase camera. It orbits behind Milo on
+// foot, swings wide and low behind a car at speed, and never clips
+// through the ground. Drag with the mouse to look around; the wheel
+// zooms the follow distance.
+import * as THREE from 'three';
+import { clamp, angleDiff } from './random.js';
 
-export function createCameraRig(G) {
-  const rig = {
-    mode: 'menu', // 'menu' | 'foot' | 'car' | 'fixed'
-    yaw: 0, pitch: 0.32,
-    fixedPos: new THREE.Vector3(0, 30, 60),
-    fixedTarget: new THREE.Vector3(0, 0, 0),
-    orbitT: 0,
-    setFixed(x, y, z, tx, ty, tz) {
-      this.mode = 'fixed';
-      this.fixedPos.set(x, y, z);
-      this.fixedTarget.set(tx, ty, tz);
-    },
-    update(dt) {
-      const cam = G.camera;
-      if (this.mode === 'fixed') {
-        cam.position.lerp(this.fixedPos, Math.min(1, dt * 4));
-        cam.lookAt(this.fixedTarget);
-        return;
-      }
-      if (this.mode === 'menu') {
-        this.orbitT += dt * 0.045;
-        const r = 190;
-        cam.position.set(Math.cos(this.orbitT) * r, 85, Math.sin(this.orbitT) * r);
-        cam.lookAt(20, 0, 0);
-        return;
-      }
-      // Mouse drag orbits the view.
-      const look = G.input.lookDelta();
-      this.yaw -= look.x * 0.0032;
-      this.pitch = clamp(this.pitch + look.y * 0.0022, -0.15, 0.9);
-      const inCar = G.player.inCar && G.player.car;
-      if (inCar) {
-        // Settle behind the car's heading (unless the player is dragging).
-        if (Math.abs(look.x) < 2) this.yaw = angleLerp(this.yaw, G.player.car.yaw, dt * 1.6);
-      }
-      const target = inCar ? G.player.car.group.position : G.player.group.position;
-      const dist = inCar ? 11 : 7.5;
-      const height = inCar ? 4.6 : 3.4;
-      // Camera yaw: 0 looks along +Z; the player faces yaw measured the same way.
-      const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
-      const px = target.x - sy * dist * Math.cos(this.pitch);
-      const pz = target.z - cy * dist * Math.cos(this.pitch);
-      const py = target.y + height + Math.sin(this.pitch) * dist * 0.5;
-      cam.position.x += (px - cam.position.x) * Math.min(1, dt * 7);
-      cam.position.y += (py - cam.position.y) * Math.min(1, dt * 7);
-      cam.position.z += (pz - cam.position.z) * Math.min(1, dt * 7);
-      cam.lookAt(target.x, target.y + 1.6, target.z);
-    },
+export function createCamera(camera) {
+  const C = { yaw: Math.PI, pitch: 0.32, dist: 9, target: new THREE.Vector3(), smooth: new THREE.Vector3(0, 2, 0) };
+  C.update = (G, dt) => {
+    const input = G.input;
+    C.yaw -= input.mouseDX * 0.004;
+    C.pitch = clamp(C.pitch + input.mouseDY * 0.003, 0.05, 1.1);
+    C.dist = clamp(C.dist + input.wheel * 0.01, 5, 16);
+    const focus = G.player.onFoot ? G.player.pos : (G.player.car ? G.player.car.pos : G.player.pos);
+    const driving = !!G.player.car;
+    // The cover chase is shot from a three-quarter rear angle so the
+    // patrol cars behind Milo stay in frame instead of behind the lens.
+    const shotOffset = G.shotMode === 'chase' ? 0.55 : 0;
+    const wantYaw = driving ? G.player.car.angle + Math.PI + shotOffset : C.yaw;
+    // On foot the camera follows the drag; in a car it eases back behind the car.
+    C.yaw += angleDiff(C.yaw, driving ? wantYaw : C.yaw) * Math.min(1, dt * (driving ? 3.5 : 8));
+    const speedBoost = driving ? Math.min(6, Math.abs(G.player.car.speed) * 0.12) : 0;
+    const dist = C.dist + speedBoost;
+    const cx = focus.x + Math.sin(C.yaw) * Math.cos(C.pitch) * dist;
+    const cz = focus.z + Math.cos(C.yaw) * Math.cos(C.pitch) * dist;
+    const cy = focus.y + 2.2 + Math.sin(C.pitch) * dist;
+    C.target.set(cx, Math.max(cy, 1.6), cz);
+    C.smooth.lerp(C.target, Math.min(1, dt * 10));
+    camera.position.copy(C.smooth);
+    camera.lookAt(focus.x, focus.y + (driving ? 1.6 : 1.8), focus.z);
   };
-  return rig;
+  return C;
 }

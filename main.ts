@@ -1,3 +1,5 @@
+// Re-authored 2026-11-18 in the post-open recorded session for the
+// saifulsidik801-ship-it account (payout wallet 4YNg…krNU in .makefun/owner.json).
 // MARISOL BAY — entry for make.fun gta6-01 ("Make GTA 6").
 // Authored in the recorded gta6-01 build session: a 3D open-world crime game
 // (Three.js, vendored) in game/, plain static files a desktop browser loads

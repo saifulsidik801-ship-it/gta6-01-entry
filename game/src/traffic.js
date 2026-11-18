@@ -1,83 +1,67 @@
-// Traffic AI: cars that drive the road grid, follow intersections as waypoints,
-// brake for the car ahead, and respawn near the player when they drift too far.
-import { makeRng, angleLerp } from './random.js';
-import { WORLD } from './config.js';
+// MARISOL BAY — traffic.js
+// One job: the city's background traffic. A dozen AI cars cruise the
+// road grid on fixed lanes, slow for each other, and honk when the
+// player blocks them. They are not the player's cars — they belong to
+// the city — but they make the streets feel alive in every screenshot.
+import * as THREE from 'three';
+import { CFG } from './config.js';
+import { clamp } from './random.js';
+import { buildCarMesh } from './vehicle.js';
 
-const ROADS = [];
-for (let v = -240; v <= 240; v += 40) ROADS.push(v);
+export function createTraffic(G) {
+  const T = { cars: [] };
+  const types = ['sedan', 'taxi', 'van', 'sedan', 'truck', 'sedan'];
+  const colors = [0x3fa7ff, 0xffc21c, 0x9aa5b1, 0xff8fa3, 0x7dff6a, 0xc3aed6, 0xf4a261, 0xffffff];
+  for (let i = 0; i < 14; i++) {
+    const road = G.world.roads[Math.floor(G.rng() * G.world.roads.length)];
+    const horizontal = G.rng() < 0.5;
+    const along = (G.rng() * 2 - 1) * (CFG.citySize / 2 - 20);
+    const type = types[i % types.length];
+    const mesh = buildCarMesh(type, colors[i % colors.length]);
+    const x = horizontal ? along : road + (G.rng() < 0.5 ? 3.5 : -3.5);
+    const z = horizontal ? road + (G.rng() < 0.5 ? 3.5 : -3.5) : along;
+    mesh.position.set(x, 0, z);
+    G.scene.add(mesh);
+    T.cars.push({
+      mesh, pos: mesh.position, type,
+      angle: horizontal ? (z > road ? Math.PI / 2 : -Math.PI / 2) : (x > road ? Math.PI : 0),
+      speed: 0, cruise: 9 + G.rng() * 6, road, horizontal, lane: (G.rng() < 0.5 ? 3.5 : -3.5),
+      honkAt: 0,
+    });
+  }
+  return T;
+}
 
-export function createTraffic(G, count) {
-  const rng = makeRng(4242);
-  const cars = [];
-  const pickRoadPoint = (near) => {
-    if (near) {
-      const cx = Math.round(G.player.x / 40) * 40, cz = Math.round(G.player.z / 40) * 40;
-      const alongRoad = rng.chance(0.5);
-      const road = (alongRoad ? cz : cx) + rng.randi(-2, 2) * 40;
-      const along = (alongRoad ? cx : cz) + rng.randi(-2, 2) * 40;
-      return { x: alongRoad ? along : road, z: alongRoad ? road : along };
+export function updateTraffic(G, dt) {
+  const T = G.traffic;
+  const half = CFG.citySize / 2;
+  for (const c of T.cars) {
+    // slow down for the car ahead on the same lane
+    let target = c.cruise;
+    for (const o of T.cars) {
+      if (o === c || o.horizontal !== c.horizontal || Math.abs(o.road - c.road) > 1) continue;
+      const ahead = c.horizontal
+        ? (c.angle > 0 ? o.pos.x - c.pos.x : c.pos.x - o.pos.x)
+        : (c.angle === 0 ? o.pos.z - c.pos.z : c.pos.z - o.pos.z);
+      if (ahead > 0 && ahead < 12) target = 0;
     }
-    const alongRoad = rng.chance(0.5);
-    return { x: alongRoad ? rng.pick(ROADS) : rng.pick(ROADS), z: alongRoad ? rng.pick(ROADS) : rng.pick(ROADS) };
-  };
-  for (let i = 0; i < count; i++) {
-    const p = pickRoadPoint(false);
-    const car = G.vehicles.spawn(rng.pick(['sedan', 'sedan', 'taxi', 'truck']), p.x, p.z, 0, 'ai');
-    const next = pickRoadPoint(false);
-    cars.push({ car, tx: next.x, tz: next.z, speed: rng.rand(8, 13), wait: 0 });
+    // stop for the player standing in the road, and honk about it
+    const p = G.player.pos;
+    const pd = Math.hypot(p.x - c.pos.x, p.z - c.pos.z);
+    if (G.player.onFoot && pd < 9) {
+      target = 0;
+      if (G.time - c.honkAt > 3) { c.honkAt = G.time; G.audio.horn(); }
+    }
+    c.speed += clamp(target - c.speed, -14 * dt, 8 * dt);
+    c.pos.x += Math.sin(c.angle) * c.speed * dt;
+    c.pos.z += Math.cos(c.angle) * c.speed * dt;
+    // wrap around the city edge so traffic never runs out
+    if (c.pos.x > half + 10) c.pos.x = -half - 10;
+    if (c.pos.x < -half - 10) c.pos.x = half + 10;
+    if (c.pos.z > half + 10) c.pos.z = -half - 10;
+    if (c.pos.z < -half - 10) c.pos.z = half + 10;
+    c.mesh.position.copy(c.pos);
+    c.mesh.rotation.y = c.angle;
+    for (const w of c.mesh.userData.wheels) w.rotation.x += c.speed * dt * 2;
   }
-
-  function retarget(t) {
-    const p = pickRoadPoint(false);
-    // Next waypoint: a nearby intersection, so cars turn instead of cutting blocks.
-    const cx = Math.round(t.car.group.position.x / 40) * 40;
-    const cz = Math.round(t.car.group.position.z / 40) * 40;
-    if (rng.chance(0.5)) { t.tx = cx + rng.pick([-40, 40]); t.tz = cz; }
-    else { t.tx = cx; t.tz = cz + rng.pick([-40, 40]); }
-    t.tx = Math.max(-240, Math.min(240, t.tx));
-    t.tz = Math.max(-240, Math.min(240, t.tz));
-  }
-
-  return {
-    cars,
-    update(dt) {
-      if (G.state.mode !== 'playing') return;
-      for (const t of cars) {
-        const c = t.car;
-        if (c.wrecked) continue;
-        const px = c.group.position.x, pz = c.group.position.z;
-        // Too far from the action: respawn on a road near the player.
-        if (Math.hypot(px - G.player.x, pz - G.player.z) > 200) {
-          const p = pickRoadPoint(true);
-          c.group.position.set(p.x, 0, p.z);
-          retarget(t);
-          continue;
-        }
-        const dx = t.tx - px, dz = t.tz - pz;
-        const dist = Math.hypot(dx, dz);
-        if (dist < 4) { retarget(t); continue; }
-        const targetYaw = Math.atan2(dx, dz);
-        c.yaw = angleLerp(c.yaw, targetYaw, dt * 2.2);
-        c.group.rotation.y = c.yaw;
-        // Brake for the car ahead (driven car, another AI car, or a cop).
-        // A startled boost (set when the player rams this car) makes it speed away.
-        if (c.boostT > 0) c.boostT -= dt;
-        let blocked = false;
-        for (const o of G.vehicles.list) {
-          if (o === c || o.wrecked) continue;
-          const ox = o.group.position.x - px, oz = o.group.position.z - pz;
-          const ahead = ox * Math.sin(c.yaw) + oz * Math.cos(c.yaw);
-          const side = Math.abs(ox * Math.cos(c.yaw) - oz * Math.sin(c.yaw));
-          if (ahead > 0 && ahead < 9 && side < 2.6) { blocked = true; break; }
-        }
-        const targetSpeed = blocked ? 0 : t.speed + (c.boostT > 0 ? 6 : 0);
-        c.speed += (targetSpeed - c.speed) * Math.min(1, dt * 1.5);
-        c.group.position.x += Math.sin(c.yaw) * c.speed * dt;
-        c.group.position.z += Math.cos(c.yaw) * c.speed * dt;
-        for (const w of c.group.userData.wheels) w.rotation.x += c.speed * dt * 1.4;
-        // Keep traffic inside the city (never onto the sand).
-        if (c.group.position.x < WORLD.CITY_MIN_X) { c.group.position.x = WORLD.CITY_MIN_X; retarget(t); }
-      }
-    },
-  };
 }

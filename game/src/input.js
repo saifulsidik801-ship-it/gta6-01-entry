@@ -1,45 +1,43 @@
-// Keyboard + mouse input, with per-frame edge detection. The game loop calls
-// endFrame() once per tick; pressed() is true only on the tick the key went down.
-import { KEYS } from './config.js';
-
-export function createInput(canvas) {
-  const keys = new Set();
-  const pressed = new Set();
-  let mouseDX = 0, mouseDY = 0, mouseDown = false, mouseClicked = false;
-  let dragging = false;
-
-  function onKeyDown(e) {
-    if (e.repeat) return;
-    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
-    if (!keys.has(e.code)) pressed.add(e.code);
-    keys.add(e.code);
-  }
-  function onKeyUp(e) { keys.delete(e.code); }
-  function onMouseDown(e) {
-    mouseDown = true; mouseClicked = true; dragging = true;
-    if (canvas.requestPointerLock) { /* pointer lock is optional; drag-look works without it */ }
-  }
-  function onMouseUp() { mouseDown = false; dragging = false; }
-  function onMouseMove(e) {
-    if (!dragging) return;
-    mouseDX += e.movementX || 0;
-    mouseDY += e.movementY || 0;
-  }
-  window.addEventListener('keydown', onKeyDown);
-  window.addEventListener('keyup', onKeyUp);
-  canvas.addEventListener('mousedown', onMouseDown);
-  window.addEventListener('mouseup', onMouseUp);
-  window.addEventListener('mousemove', onMouseMove);
-
-  const has = (list) => list.some((c) => keys.has(c));
-  return {
-    down: (code) => keys.has(code),
-    pressed: (code) => pressed.has(code),
-    axisX: () => (has(KEYS.RIGHT) ? 1 : 0) - (has(KEYS.LEFT) ? 1 : 0),
-    axisY: () => (has(KEYS.UP) ? 1 : 0) - (has(KEYS.DOWN) ? 1 : 0),
-    get mouseDown() { return mouseDown; },
-    consumeClick: () => { const c = mouseClicked; mouseClicked = false; return c; },
-    lookDelta: () => { const d = { x: mouseDX, y: mouseDY }; mouseDX = 0; mouseDY = 0; return d; },
-    endFrame: () => { pressed.clear(); },
+// MARISOL BAY — input.js
+// One job: read the keyboard and mouse into one plain object the
+// player, camera and menus all read from. No game logic lives here.
+export function createInput() {
+  const keys = {};
+  // Edge-triggered presses: a keydown sets the flag, and the first
+  // consumer to ask for it clears it. Polling `keys` once per frame can
+  // miss a tap entirely when the frame rate is low; a press flag never
+  // gets lost between frames, which is what menus and car entry need.
+  const pressedFlags = {};
+  const input = {
+    keys,
+    mouseDX: 0, mouseDY: 0, mouseDown: false,
+    wheel: 0,
+    pressed(code) { const v = !!pressedFlags[code]; pressedFlags[code] = false; return v; },
+    // True while any of the listed keys is held.
+    any(...names) { return names.some((n) => keys[n]); },
+    axis() {
+      let x = 0, y = 0;
+      if (keys.KeyW || keys.ArrowUp) y += 1;
+      if (keys.KeyS || keys.ArrowDown) y -= 1;
+      if (keys.KeyA || keys.ArrowLeft) x -= 1;
+      if (keys.KeyD || keys.ArrowRight) x += 1;
+      return { x, y };
+    },
   };
+  window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (!e.repeat) pressedFlags[e.code] = true;
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('blur', () => { for (const k of Object.keys(keys)) keys[k] = false; });
+  window.addEventListener('mousemove', (e) => {
+    if (input.mouseDown) { input.mouseDX += e.movementX || 0; input.mouseDY += e.movementY || 0; }
+  });
+  window.addEventListener('mousedown', (e) => { if (e.button === 0) input.mouseDown = true; });
+  window.addEventListener('mouseup', (e) => { if (e.button === 0) input.mouseDown = false; });
+  window.addEventListener('wheel', (e) => { input.wheel += e.deltaY; }, { passive: true });
+  // Called once per frame by main.js after every consumer has read it.
+  input.consumeMouse = () => { input.mouseDX = 0; input.mouseDY = 0; input.wheel = 0; };
+  return input;
 }

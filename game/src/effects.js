@@ -1,71 +1,50 @@
-// Particles: one THREE.Points pool for skid smoke, muzzle sparks, hits and
-// explosions. Colours fade to black (additive blending) so dead particles vanish.
-import * as THREE from '../vendor/three.module.min.js';
+// MARISOL BAY — effects.js
+// One job: particles — skid smoke, crash sparks, muzzle flashes, dust
+// and the little cash sparkle when turf income lands. One shared pool
+// of small bright meshes, recycled every frame, so nothing allocates
+// while the chase is running.
+import * as THREE from 'three';
 
-const MAX = 700;
-
-export function createEffects(G) {
-  const geo = new THREE.BufferGeometry();
-  const pos = new Float32Array(MAX * 3);
-  const col = new Float32Array(MAX * 3);
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  const mat = new THREE.PointsMaterial({
-    size: 0.7, vertexColors: true, transparent: true, opacity: 0.95,
-    blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
-  });
-  const points = new THREE.Points(geo, mat);
-  points.frustumCulled = false;
-  G.scene.add(points);
-  const parts = [];
-  for (let i = 0; i < MAX; i++) parts.push({ alive: false, x: 0, y: -99, z: 0, vx: 0, vy: 0, vz: 0, life: 0, max: 1, r: 1, g: 1, b: 1, grav: 0 });
-  let cursor = 0;
-
-  function spawn(x, y, z, vx, vy, vz, life, r, g, b, grav) {
-    const p = parts[cursor]; cursor = (cursor + 1) % MAX;
-    p.alive = true; p.x = x; p.y = y; p.z = z; p.vx = vx; p.vy = vy; p.vz = vz;
-    p.life = life; p.max = life; p.r = r; p.g = g; p.b = b; p.grav = grav || 0;
+export function createEffects(scene) {
+  const MAX = 420;
+  const geo = new THREE.BoxGeometry(0.22, 0.22, 0.22);
+  const mats = {};
+  const pool = [];
+  for (let i = 0; i < MAX; i++) {
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true }));
+    m.visible = false; scene.add(m); pool.push({ mesh: m, life: 0, max: 1, vel: new THREE.Vector3(), grav: 0, grow: 0 });
   }
-  function burst(p, color, n, speed, life, up) {
-    const c = new THREE.Color(color);
-    for (let i = 0; i < n; i++) {
-      const a = Math.random() * Math.PI * 2, e = (Math.random() - 0.3) * Math.PI;
-      const s = speed * (0.4 + Math.random() * 0.8);
-      spawn(p.x, p.y, p.z,
-        Math.cos(a) * Math.cos(e) * s, Math.sin(e) * s + (up || 0), Math.sin(a) * Math.cos(e) * s,
-        life * (0.6 + Math.random() * 0.7), c.r, c.g, c.b, -4);
+  let cursor = 0;
+  const E = { pool, MAX };
+  function spawn(x, y, z, color, count, speed, life, grav, size, grow) {
+    for (let n = 0; n < count; n++) {
+      const p = pool[cursor]; cursor = (cursor + 1) % MAX;
+      p.mesh.visible = true;
+      p.mesh.position.set(x + (Math.random() - 0.5) * 0.4, y + (Math.random() - 0.5) * 0.4, z + (Math.random() - 0.5) * 0.4);
+      p.mesh.material.color.setHex(color);
+      p.mesh.material.opacity = 1;
+      p.mesh.scale.setScalar(size || 1);
+      const a = Math.random() * Math.PI * 2, b = Math.random() * Math.PI - Math.PI / 2;
+      p.vel.set(Math.cos(a) * Math.cos(b), Math.abs(Math.sin(b)) + 0.4, Math.sin(a) * Math.cos(b)).multiplyScalar(speed * (0.5 + Math.random()));
+      p.life = 0; p.max = life * (0.6 + Math.random() * 0.8); p.grav = grav; p.grow = grow || 0;
     }
   }
-  return {
-    burst,
-    smoke(p) { // grey-ish puff, slow rise
-      for (let i = 0; i < 3; i++) {
-        spawn(p.x + (Math.random() - 0.5), p.y + 0.2, p.z + (Math.random() - 0.5),
-          (Math.random() - 0.5) * 0.6, 0.8 + Math.random(), (Math.random() - 0.5) * 0.6,
-          0.9, 0.45, 0.45, 0.48, 1.5);
-      }
-    },
-    sparks(p) { burst(p, 0xffd23a, 10, 7, 0.4, 2); },
-    blood(p) { burst(p, 0xc0392b, 8, 4, 0.5, 1); },
-    explosion(p) {
-      burst(p, 0xff7a1a, 26, 11, 0.9, 3);
-      burst(p, 0xffe08a, 14, 6, 0.6, 2);
-    },
-    update(dt) {
-      for (let i = 0; i < MAX; i++) {
-        const p = parts[i];
-        if (!p.alive) { pos[i * 3 + 1] = -99; continue; }
-        p.life -= dt;
-        if (p.life <= 0) { p.alive = false; pos[i * 3 + 1] = -99; col[i * 3] = col[i * 3 + 1] = col[i * 3 + 2] = 0; continue; }
-        p.vy += p.grav * dt;
-        p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
-        if (p.y < 0.05) { p.y = 0.05; p.vy = 0; }
-        const f = p.life / p.max;
-        pos[i * 3] = p.x; pos[i * 3 + 1] = p.y; pos[i * 3 + 2] = p.z;
-        col[i * 3] = p.r * f; col[i * 3 + 1] = p.g * f; col[i * 3 + 2] = p.b * f;
-      }
-      geo.attributes.position.needsUpdate = true;
-      geo.attributes.color.needsUpdate = true;
-    },
+  E.smoke = (x, y, z, n) => spawn(x, y, z, 0xd8d8d8, n || 6, 1.6, 0.9, 1.5, 1.6, 2.2);
+  E.sparks = (x, y, z, n) => spawn(x, y, z, 0xffc21c, n || 10, 7, 0.5, -6, 0.8, 0);
+  E.muzzle = (x, y, z) => spawn(x, y, z, 0xffe066, 8, 4, 0.12, 0, 1.4, 0);
+  E.dust = (x, y, z, n) => spawn(x, y, z, 0xe8d9a0, n || 4, 1.2, 0.7, 0.5, 1.2, 1.5);
+  E.cash = (x, y, z) => spawn(x, y, z, 0x7dff6a, 12, 3, 0.8, 2, 1, 0);
+  E.splash = (x, y, z) => spawn(x, y, z, 0x2ec8d8, 10, 4, 0.6, -8, 1, 0);
+  E.update = (dt) => {
+    for (const p of pool) {
+      if (!p.mesh.visible) continue;
+      p.life += dt;
+      if (p.life >= p.max) { p.mesh.visible = false; continue; }
+      p.vel.y -= p.grav * dt;
+      p.mesh.position.addScaledVector(p.vel, dt);
+      p.mesh.material.opacity = 1 - p.life / p.max;
+      if (p.grow) p.mesh.scale.addScalar(p.grow * dt);
+    }
   };
+  return E;
 }
