@@ -1,111 +1,101 @@
-// MARISOL BAY — garage.js
-// One job: Milo's garage — the shop where turf income turns into metal.
-// Buy a Sport, a Truck or a Van (it spawns beside Milo, ready to steal
-// into), repair the body, or bribe the heat away. Cash is the only
-// currency; the shop never sells anything the player cannot afford,
-// and it never touches the save except through the normal save flow.
-import { VEHICLES } from './config.js';
-import { makeCar } from './vehicle.js';
+// Garage — Rico's shop. Spend turf income on cars and upgrades: a faster
+// engine, thicker armor, better grip. Owned cars can be called to the
+// player's position; the selected car is what missions hand you at start.
+import { CONFIG } from './config.js';
+import { Vehicle } from './vehicle.js';
 
-const STOCK = [
-  { type: 'sport', blurb: 'Top speed 137 km/h — outrun anything with a siren' },
-  { type: 'truck', blurb: 'Slow, heavy, unstoppable — rams through roadblocks' },
-  { type: 'van', blurb: 'Roomy and steady — the working driver’s pick' },
-];
+export const UPGRADES = {
+  engine: { name: 'Turbo Engine', costs: [600, 1200, 2200], desc: '+18% top speed per level' },
+  armor: { name: 'Plated Armor', costs: [500, 1000, 1800], desc: '+40 max health per level' },
+  grip: { name: 'Race Tires', costs: [400, 900, 1600], desc: '+12% grip and steering per level' },
+};
 
-export function createGarage(G) {
-  const GR = { open: false };
-  const $ = (id) => document.getElementById(id);
-
-  function refresh() {
-    const cashEl = $('shop-cash');
-    if (cashEl) cashEl.textContent = `$${Math.round(G.cash).toLocaleString('en-US')}`;
-    for (const item of STOCK) {
-      const btn = $(`btn-buy-${item.type}`);
-      if (!btn) continue;
-      const def = VEHICLES[item.type];
-      const owned = G.carsOwned.includes(item.type);
-      btn.textContent = owned ? `🚗 ${def.name} — DRIVE IT (owned)` : `🚗 ${def.name} — $${def.price.toLocaleString('en-US')}`;
-      btn.disabled = !owned && G.cash < def.price;
-      btn.style.opacity = btn.disabled ? '0.55' : '1';
-    }
-    const repair = $('btn-repair');
-    if (repair) { repair.disabled = G.player.health >= 100 && !G.player.car; repair.textContent = '🔧 Full repair + heal — $150'; }
-    const bribe = $('btn-bribe');
-    if (bribe) { bribe.disabled = G.wanted === 0 || G.cash < 500; bribe.textContent = '🤫 Bribe the heat away — $500'; }
+export class Garage {
+  constructor(save, scene, world) {
+    this.save = save;
+    this.scene = scene;
+    this.world = world;
+    this.spawned = null; // currently called-in Vehicle
   }
 
-  function spawnNear(type) {
-    const P = G.player;
-    const x = P.pos.x + Math.sin(P.angle + 1.2) * 5;
-    const z = P.pos.z + Math.cos(P.angle + 1.2) * 5;
-    const car = makeCar(G, type, x, z, P.angle);
-    car.parked = true;
-    return car;
+  owned() { return this.save.data.garage.owned; }
+  upgradesFor(type) { return this.save.data.garage.upgrades[type] || {}; }
+
+  level(type, key) { return (this.upgradesFor(type)[key] || 0); }
+
+  buyVehicle(type) {
+    const spec = CONFIG.vehicles[type];
+    if (!spec || spec.price <= 0) return { ok: false, reason: 'Not for sale' };
+    if (this.owned().includes(type)) return { ok: false, reason: 'Already owned' };
+    if (this.save.data.cash < spec.price) return { ok: false, reason: 'Not enough cash' };
+    this.save.data.cash -= spec.price;
+    this.save.data.garage.owned.push(type);
+    this.save.save({ cash: this.save.data.cash, garage: this.save.data.garage });
+    return { ok: true };
   }
 
-  GR.buy = (type) => {
-    const def = VEHICLES[type];
-    if (!def) return;
-    if (G.carsOwned.includes(type)) {
-      spawnNear(type);
-      G.hud.flash(`Your ${def.name} is parked right beside you`);
-      G.audio.horn();
-      return;
-    }
-    if (G.cash < def.price) { G.hud.flash(`Not enough cash for the ${def.name} — $${def.price}`); return; }
-    G.cash -= def.price;
-    G.carsOwned.push(type);
-    spawnNear(type);
-    G.audio.cash();
-    G.hud.flash(`Bought the ${def.name} for $${def.price} — it is yours now`);
-    refresh();
-  };
-
-  GR.repair = () => {
-    if (G.cash < 150) { G.hud.flash('Repair costs $150'); return; }
-    G.cash -= 150;
-    G.player.health = 100;
-    if (G.player.car) G.player.car.speed = 0;
-    G.audio.pickup();
-    G.hud.flash('Patched up — full health');
-    refresh();
-  };
-
-  GR.bribe = () => {
-    if (G.wanted === 0 || G.cash < 500) return;
-    G.cash -= 500;
-    G.wanted = 0;
-    G.audio.cash();
-    G.hud.flash('The heat is gone — somebody got paid');
-    refresh();
-  };
-
-  GR.toggle = () => {
-    if (GR.open) {
-      GR.open = false;
-      const el = $('shop'); if (el) el.style.display = 'none';
-      if (G.mode === 'paused') { G.mode = 'playing'; G.hud.showPause(false); }
-    } else {
-      if (G.mode !== 'playing') return;
-      GR.open = true;
-      refresh();
-      const el = $('shop'); if (el) el.style.display = 'flex';
-      G.mode = 'paused'; // the city waits while Milo shops
-    }
-  };
-
-  // Wire the buttons once; the shop is pure DOM over the live game.
-  for (const item of STOCK) {
-    const btn = $(`btn-buy-${item.type}`);
-    if (btn) btn.addEventListener('click', () => GR.buy(item.type));
+  buyUpgrade(type, key) {
+    const up = UPGRADES[key];
+    const lvl = this.level(type, key);
+    if (lvl >= up.costs.length) return { ok: false, reason: 'Maxed out' };
+    const cost = up.costs[lvl];
+    if (this.save.data.cash < cost) return { ok: false, reason: 'Not enough cash' };
+    this.save.data.cash -= cost;
+    const ups = this.save.data.garage.upgrades;
+    ups[type] = { ...(ups[type] || {}), [key]: lvl + 1 };
+    this.save.save({ cash: this.save.data.cash, garage: this.save.data.garage });
+    return { ok: true };
   }
-  const repair = $('btn-repair');
-  if (repair) repair.addEventListener('click', () => GR.repair());
-  const bribe = $('btn-bribe');
-  if (bribe) bribe.addEventListener('click', () => GR.bribe());
-  const close = $('btn-shop-close');
-  if (close) close.addEventListener('click', () => GR.toggle());
-  GR.refresh = refresh;
-  return GR;
+
+  // Apply owned upgrades to a live vehicle spec (multiplicative, capped).
+  tunedSpec(type) {
+    const base = CONFIG.vehicles[type];
+    const lvl = (k) => this.level(type, k);
+    return {
+      ...base,
+      top: base.top * (1 + 0.18 * lvl('engine')),
+      steer: base.steer * (1 + 0.12 * lvl('grip')),
+      grip: base.grip * (1 + 0.12 * lvl('grip')),
+    };
+  }
+
+  // Call the selected car to the player: it appears on the nearest road.
+  callCar(playerPos, heading) {
+    const type = this.save.data.garage.selected || 'sedan';
+    if (this.spawned) this.spawned.remove();
+    const spec = this.tunedSpec(type);
+    const x = playerPos.x + Math.sin(heading) * 10;
+    const z = playerPos.z + Math.cos(heading) * 10;
+    const v = new Vehicle(this.scene, type, x, z, heading);
+    v.spec = spec;
+    v.health = 100 + 40 * this.level(type, 'armor');
+    this.spawned = v;
+    return v;
+  }
+
+  renderList(doc) {
+    // Fill the garage panel (menu + pause) with buy buttons. Called on open.
+    const lists = doc.querySelectorAll('#garage-list, #garage-list-2');
+    lists.forEach((list) => {
+      list.innerHTML = '';
+      for (const [type, spec] of Object.entries(CONFIG.vehicles)) {
+        if (type === 'police') continue;
+        const owned = this.owned().includes(type);
+        const row = doc.createElement('div');
+        row.className = 'garage-row';
+        const eng = this.level(type, 'engine'), arm = this.level(type, 'armor'), grp = this.level(type, 'grip');
+        row.innerHTML = `<b>${spec.name}</b> — top ${Math.round(this.tunedSpec(type).top * 2.4)} mph` +
+          ` · ENG ${eng} ARM ${arm} GRIP ${grp}` +
+          (owned ? ` <span class="owned">OWNED</span>` : spec.price ? ` <button data-buy="${type}">BUY $${spec.price}</button>` : ' <span class="owned">STREET</span>');
+        list.appendChild(row);
+      }
+      list.querySelectorAll('[data-buy]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const r = this.buyVehicle(btn.dataset.buy);
+          if (r.ok) this.renderList(doc);
+          else btn.textContent = r.reason;
+        });
+      });
+    });
+  }
 }

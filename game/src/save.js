@@ -1,59 +1,47 @@
-// MARISOL BAY — save.js
-// One job: persist Milo's progress (cash, turf, missions, collectibles,
-// best times) to localStorage and load it back. The game never depends
-// on a save existing; a missing or corrupt save just starts fresh.
+// Save — localStorage persistence for cash, turf, completed missions,
+// best stats and options. One key, one JSON blob, versioned so a future
+// build can migrate instead of crashing on a stale save.
 const KEY = 'marisol-bay-save-v1';
 
-export function loadSave() {
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (!data || typeof data !== 'object') return null;
-    return data;
-  } catch (err) {
-    return null;
-  }
-}
+export class SaveSystem {
+  constructor() { this.data = this.load(); }
 
-export function writeSave(G) {
-  try {
-    const data = {
-      cash: Math.round(G.cash),
-      health: Math.round(G.player.health),
-      wanted: G.wanted,
-      turf: G.turf.slice(),
-      missionIndex: G.missionIndex,
-      missionsDone: G.missionsDone.slice(),
-      collected: G.collected.slice(),
-      taxiFares: G.stats.taxiFares,
-      trialsWon: G.stats.trialsWon,
-      carsOwned: G.carsOwned.slice(),
-      playSeconds: Math.round(G.stats.playSeconds),
-      savedAt: Date.now(),
+  load() {
+    try {
+      const raw = localStorage.getItem(KEY);
+      if (!raw) return this.fresh();
+      const d = JSON.parse(raw);
+      if (d.version !== 1) return this.fresh();
+      return { ...this.fresh(), ...d };
+    } catch {
+      return this.fresh();
+    }
+  }
+
+  fresh() {
+    return {
+      version: 1,
+      cash: 150,
+      owned: {},
+      done: [],
+      packagesTaken: 0,
+      bestTurf: 0,
+      totalEarned: 0,
+      missionsCompleted: 0,
+      options: { volume: 0.5, muted: false, quality: 'high' },
+      garage: { owned: ['sedan'], selected: 'sedan', upgrades: {} },
+      savedAt: 0,
     };
-    localStorage.setItem(KEY, JSON.stringify(data));
-    return true;
-  } catch (err) {
-    return false;
   }
-}
 
-export function applySave(G, data) {
-  if (!data) return false;
-  G.cash = typeof data.cash === 'number' ? data.cash : G.cash;
-  if (typeof data.health === 'number') G.player.health = data.health;
-  if (Array.isArray(data.turf) && data.turf.length === 6) G.turf = data.turf.map(Boolean);
-  if (typeof data.missionIndex === 'number') G.missionIndex = data.missionIndex;
-  if (Array.isArray(data.missionsDone)) G.missionsDone = data.missionsDone.map(Boolean);
-  if (Array.isArray(data.collected)) G.collected = data.collected.map(Boolean);
-  if (typeof data.taxiFares === 'number') G.stats.taxiFares = data.taxiFares;
-  if (typeof data.trialsWon === 'number') G.stats.trialsWon = data.trialsWon;
-  if (Array.isArray(data.carsOwned)) G.carsOwned = data.carsOwned.slice();
-  if (typeof data.playSeconds === 'number') G.stats.playSeconds = data.playSeconds;
-  return true;
-}
+  save(patch) {
+    this.data = { ...this.data, ...patch, savedAt: Date.now() };
+    try { localStorage.setItem(KEY, JSON.stringify(this.data)); return true; }
+    catch { return false; }
+  }
 
-export function clearSave() {
-  try { localStorage.removeItem(KEY); } catch (err) { /* fresh start anyway */ }
+  clear() {
+    try { localStorage.removeItem(KEY); } catch { /* private mode */ }
+    this.data = this.fresh();
+  }
 }
