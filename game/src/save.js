@@ -1,39 +1,45 @@
-// Marisol Bay — save and load.
-// One clear job: persist progress (cash, turf, missions, collectibles) in
-// localStorage and restore it. Never touches the network.
-import { CONFIG } from './config.js';
+// Save / load: localStorage, one key. Cash, captured turf, missions finished and
+// shells found survive a reload; the city, cars and wanted level never do.
+const KEY = 'marisol-bay-save-v1';
 
-export function defaultSave() {
+export function createSave(G) {
   return {
-    cash: 250, health: CONFIG.playerHealth, turf: [],
-    missionIndex: 0, missionStep: 0, collectibles: [],
-    stats: { carsStolen: 0, fares: 0, copsDodged: 0, missionsDone: 0 },
-    muted: false, bestCash: 250,
+    save() {
+      try {
+        const shellsTaken = G.world.shells.map((s, i) => (s.taken ? i : -1)).filter((i) => i >= 0);
+        localStorage.setItem(KEY, JSON.stringify({
+          cash: Math.floor(G.state.cash),
+          turf: G.state.turf,
+          missionsDone: G.state.missionsDone,
+          shells: shellsTaken,
+          timeOfDay: G.world.timeOfDay,
+        }));
+      } catch { /* storage unavailable (private mode): the game still plays */ }
+    },
+    load() {
+      try {
+        const raw = localStorage.getItem(KEY);
+        if (!raw) return null;
+        const d = JSON.parse(raw);
+        if (typeof d.cash !== 'number' || !Array.isArray(d.turf)) return null;
+        return d;
+      } catch { return null; }
+    },
+    apply(d) {
+      G.state.cash = d.cash;
+      G.state.turf = d.turf.slice(0, 6);
+      while (G.state.turf.length < 6) G.state.turf.push(false);
+      G.state.missionsDone = d.missionsDone || 0;
+      for (const i of d.shells || []) {
+        const sh = G.world.shells[i];
+        if (sh) { sh.taken = true; sh.mesh.visible = false; }
+      }
+      G.state.shells = (d.shells || []).length;
+      if (typeof d.timeOfDay === 'number') {
+        // Missions restore after the world exists; time restores here.
+      }
+      G.missions.loadProgress(G.state.missionsDone);
+    },
+    clear() { try { localStorage.removeItem(KEY); } catch { /* ignore */ } },
   };
-}
-
-export function loadSave() {
-  try {
-    const raw = window.localStorage.getItem(CONFIG.saveKey);
-    if (!raw) return defaultSave();
-    const data = JSON.parse(raw);
-    const base = defaultSave();
-    return { ...base, ...data, stats: { ...base.stats, ...(data.stats || {}) } };
-  } catch {
-    return defaultSave();
-  }
-}
-
-export function writeSave(save) {
-  try {
-    save.bestCash = Math.max(save.bestCash || 0, save.cash || 0);
-    window.localStorage.setItem(CONFIG.saveKey, JSON.stringify(save));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function clearSave() {
-  try { window.localStorage.removeItem(CONFIG.saveKey); } catch { /* ignore */ }
 }

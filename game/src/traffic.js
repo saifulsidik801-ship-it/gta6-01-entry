@@ -1,84 +1,83 @@
-// Marisol Bay — traffic.
-// One clear job: cars that drive the road grid like citizens — lane offset,
-// turns at intersections, slowing for the car ahead — so the streets feel
-// alive from the kerb and from behind the wheel.
-import { CONFIG, nearestRoadCoord, roadCoord } from './config.js';
-import { createVehicle, driveVehicle } from './vehicle.js';
-import { mulberry32 } from './random.js';
+// Traffic AI: cars that drive the road grid, follow intersections as waypoints,
+// brake for the car ahead, and respawn near the player when they drift too far.
+import { makeRng, angleLerp } from './random.js';
+import { WORLD } from './config.js';
 
-export function createTraffic(scene, rng, count) {
+const ROADS = [];
+for (let v = -240; v <= 240; v += 40) ROADS.push(v);
+
+export function createTraffic(G, count) {
+  const rng = makeRng(4242);
   const cars = [];
-  const types = ['sedan', 'taxi', 'van', 'sedan', 'truck', 'sedan'];
-  for (let i = 0; i < count; i++) {
-    const vertical = rng() < 0.5;
-    const road = roadCoord(Math.floor(rng() * 9));
-    const along = roadCoord(Math.floor(rng() * 9));
-    const dir = rng() < 0.5 ? 1 : -1;
-    const lane = dir > 0 ? 3.2 : -3.2;
-    const x = vertical ? road + lane : along;
-    const z = vertical ? along : road + lane;
-    const angle = vertical ? (dir > 0 ? 0 : Math.PI) : (dir > 0 ? Math.PI / 2 : -Math.PI / 2);
-    const car = createVehicle(scene, types[Math.floor(rng() * types.length)], x, z, angle, undefined);
-    car.driver = 'traffic';
-    car.parked = false;
-    car.speed = 8 + rng() * 8;
-    car.cruise = car.speed;
-    car.turnT = rng() * 3;
-    cars.push(car);
-  }
-  return cars;
-}
-
-function carAhead(G, car, dist) {
-  const fx = Math.sin(car.angle); const fz = Math.cos(car.angle);
-  let nearest = null; let best = dist;
-  const all = [...G.traffic, ...G.parkedCars, ...G.copCars];
-  for (const other of all) {
-    if (other === car) continue;
-    const dx = other.pos.x - car.pos.x; const dz = other.pos.z - car.pos.z;
-    const along = dx * fx + dz * fz;
-    const side = Math.abs(dx * fz - dz * fx);
-    if (along > 0 && along < best && side < 3) { best = along; nearest = other; }
-  }
-  // The player on foot in front of a car makes it brake too.
-  if (G.player.onFoot) {
-    const dx = G.player.pos.x - car.pos.x; const dz = G.player.pos.z - car.pos.z;
-    const along = dx * fx + dz * fz;
-    const side = Math.abs(dx * fz - dz * fx);
-    if (along > 0 && along < best && side < 2.5) { best = along; nearest = 'player'; }
-  }
-  return nearest ? best : null;
-}
-
-export function updateTraffic(G, dt) {
-  for (const car of G.traffic) {
-    car.turnT = Math.max(0, (car.turnT || 0) - dt);
-    // Slow for the car (or person) ahead.
-    const ahead = carAhead(G, car, 16);
-    const target = ahead !== null ? Math.max(0, car.cruise * (ahead / 16)) : car.cruise;
-    const ctrl = {
-      throttle: target > car.speed ? Math.min(1, target / car.spec.top + 0.05) : 0,
-      steer: 0,
-      brake: target < car.speed - 2,
-    };
-    driveVehicle(G, car, ctrl, dt);
-    // At an intersection, sometimes turn onto the cross street.
-    const nearX = Math.abs(car.pos.x - nearestRoadCoord(car.pos.x)) < 1.2;
-    const nearZ = Math.abs(car.pos.z - nearestRoadCoord(car.pos.z)) < 1.2;
-    if (nearX && nearZ && car.turnT <= 0 && Math.random() < dt * 0.25) {
-      const turn = Math.random() < 0.5 ? Math.PI / 2 : -Math.PI / 2;
-      car.angle += turn;
-      car.mesh.rotation.y = car.angle;
-      car.turnT = 3;
-      // Re-centre on the new road with the right lane offset.
-      const fx = Math.sin(car.angle); const fz = Math.cos(car.angle);
-      car.pos.x = nearestRoadCoord(car.pos.x) + fz * 3.2;
-      car.pos.z = nearestRoadCoord(car.pos.z) + fx * 3.2;
+  const pickRoadPoint = (near) => {
+    if (near) {
+      const cx = Math.round(G.player.x / 40) * 40, cz = Math.round(G.player.z / 40) * 40;
+      const alongRoad = rng.chance(0.5);
+      const road = (alongRoad ? cz : cx) + rng.randi(-2, 2) * 40;
+      const along = (alongRoad ? cx : cz) + rng.randi(-2, 2) * 40;
+      return { x: alongRoad ? along : road, z: alongRoad ? road : along };
     }
-    // Wrap around the city edge so traffic never runs out.
-    if (car.pos.x > 310) car.pos.x = -310;
-    if (car.pos.x < -310) car.pos.x = 310;
-    if (car.pos.z > 310) car.pos.z = -310;
-    if (car.pos.z < -310) car.pos.z = 310;
+    const alongRoad = rng.chance(0.5);
+    return { x: alongRoad ? rng.pick(ROADS) : rng.pick(ROADS), z: alongRoad ? rng.pick(ROADS) : rng.pick(ROADS) };
+  };
+  for (let i = 0; i < count; i++) {
+    const p = pickRoadPoint(false);
+    const car = G.vehicles.spawn(rng.pick(['sedan', 'sedan', 'taxi', 'truck']), p.x, p.z, 0, 'ai');
+    const next = pickRoadPoint(false);
+    cars.push({ car, tx: next.x, tz: next.z, speed: rng.rand(8, 13), wait: 0 });
   }
+
+  function retarget(t) {
+    const p = pickRoadPoint(false);
+    // Next waypoint: a nearby intersection, so cars turn instead of cutting blocks.
+    const cx = Math.round(t.car.group.position.x / 40) * 40;
+    const cz = Math.round(t.car.group.position.z / 40) * 40;
+    if (rng.chance(0.5)) { t.tx = cx + rng.pick([-40, 40]); t.tz = cz; }
+    else { t.tx = cx; t.tz = cz + rng.pick([-40, 40]); }
+    t.tx = Math.max(-240, Math.min(240, t.tx));
+    t.tz = Math.max(-240, Math.min(240, t.tz));
+  }
+
+  return {
+    cars,
+    update(dt) {
+      if (G.state.mode !== 'playing') return;
+      for (const t of cars) {
+        const c = t.car;
+        if (c.wrecked) continue;
+        const px = c.group.position.x, pz = c.group.position.z;
+        // Too far from the action: respawn on a road near the player.
+        if (Math.hypot(px - G.player.x, pz - G.player.z) > 200) {
+          const p = pickRoadPoint(true);
+          c.group.position.set(p.x, 0, p.z);
+          retarget(t);
+          continue;
+        }
+        const dx = t.tx - px, dz = t.tz - pz;
+        const dist = Math.hypot(dx, dz);
+        if (dist < 4) { retarget(t); continue; }
+        const targetYaw = Math.atan2(dx, dz);
+        c.yaw = angleLerp(c.yaw, targetYaw, dt * 2.2);
+        c.group.rotation.y = c.yaw;
+        // Brake for the car ahead (driven car, another AI car, or a cop).
+        // A startled boost (set when the player rams this car) makes it speed away.
+        if (c.boostT > 0) c.boostT -= dt;
+        let blocked = false;
+        for (const o of G.vehicles.list) {
+          if (o === c || o.wrecked) continue;
+          const ox = o.group.position.x - px, oz = o.group.position.z - pz;
+          const ahead = ox * Math.sin(c.yaw) + oz * Math.cos(c.yaw);
+          const side = Math.abs(ox * Math.cos(c.yaw) - oz * Math.sin(c.yaw));
+          if (ahead > 0 && ahead < 9 && side < 2.6) { blocked = true; break; }
+        }
+        const targetSpeed = blocked ? 0 : t.speed + (c.boostT > 0 ? 6 : 0);
+        c.speed += (targetSpeed - c.speed) * Math.min(1, dt * 1.5);
+        c.group.position.x += Math.sin(c.yaw) * c.speed * dt;
+        c.group.position.z += Math.cos(c.yaw) * c.speed * dt;
+        for (const w of c.group.userData.wheels) w.rotation.x += c.speed * dt * 1.4;
+        // Keep traffic inside the city (never onto the sand).
+        if (c.group.position.x < WORLD.CITY_MIN_X) { c.group.position.x = WORLD.CITY_MIN_X; retarget(t); }
+      }
+    },
+  };
 }

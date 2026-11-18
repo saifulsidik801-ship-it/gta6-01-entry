@@ -1,329 +1,259 @@
-// Marisol Bay — the city itself.
-// One clear job: build Marisol Bay from the seed: roads, blocks, buildings,
-// beach and sea, marina, streetlights, trees, sky and sun. Also owns the
-// collision boxes (colliders) and the day/dusk/night lighting.
-//
-// Performance note: repeated pieces (road dashes, sidewalks, buildings,
-// roofs, window strips, palms, streetlights) are InstancedMesh — one draw
-// call each — so the city stays smooth in desktop Chrome and in software GL.
-import * as THREE from 'three';
-import { CONFIG, districtAt, nearestRoadCoord } from './config.js';
-import { mulberry32, pick, range } from './random.js';
+// MARISOL BAY — the city itself: ground with painted road markings, a 40 m road
+// grid, district-tinted buildings with lit windows, beach + marina + port,
+// palms, streetlights, and the collision boxes everything else walks and drives
+// against. All placement is seeded, so the city is identical every run.
+import * as THREE from '../vendor/three.module.min.js';
+import { WORLD, DISTRICTS, districtAt } from './config.js';
+import { makeRng, clamp } from './random.js';
 
-const dummy = new THREE.Object3D();
-
-// Fill an InstancedMesh from a list of {x,y,z, sx,sy,sz, ry} transforms.
-function fillInstances(mesh, list, colorList) {
-  list.forEach((t, i) => {
-    dummy.position.set(t.x, t.y, t.z);
-    dummy.rotation.set(t.rx || 0, t.ry || 0, t.rz || 0);
-    dummy.scale.set(t.sx ?? 1, t.sy ?? 1, t.sz ?? 1);
-    dummy.updateMatrix();
-    mesh.setMatrixAt(i, dummy.matrix);
-    if (colorList) mesh.setColorAt(i, new THREE.Color(colorList[i]));
-  });
-  mesh.instanceMatrix.needsUpdate = true;
-  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  return mesh;
+function groundTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 1024;
+  const g = c.getContext('2d');
+  g.fillStyle = '#23272e'; g.fillRect(0, 0, 1024, 1024); // asphalt
+  const toPx = (v) => ((v + WORLD.HALF) / WORLD.SIZE) * 1024;
+  const roadPx = (WORLD.ROAD_WIDTH / WORLD.SIZE) * 1024;
+  // Sidewalk blocks between roads.
+  g.fillStyle = '#3a3f47';
+  for (let x = WORLD.ROAD_MIN + WORLD.ROAD_STEP; x <= WORLD.ROAD_MAX; x += WORLD.ROAD_STEP) {
+    for (let z = WORLD.ROAD_MIN + WORLD.ROAD_STEP; z <= WORLD.ROAD_MAX; z += WORLD.ROAD_STEP) {
+      g.fillRect(toPx(x - 13), toPx(z - 13), (26 / WORLD.SIZE) * 1024, (26 / WORLD.SIZE) * 1024);
+    }
+  }
+  // Centre dashes on every road.
+  g.fillStyle = '#d8d23a';
+  for (let v = WORLD.ROAD_MIN; v <= WORLD.ROAD_MAX; v += WORLD.ROAD_STEP) {
+    for (let u = WORLD.ROAD_MIN; u < WORLD.ROAD_MAX; u += 16) {
+      g.fillRect(toPx(u), toPx(v) - 2, (8 / WORLD.SIZE) * 1024, 4);
+      g.fillRect(toPx(v) - 2, toPx(u), 4, (8 / WORLD.SIZE) * 1024);
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 4;
+  return tex;
 }
 
-export function buildWorld(scene, seed) {
-  const rng = mulberry32(seed);
-  const world = {
-    colliders: [],        // {x0,z0,x1,z1}
-    buildings: [],
-    streetlights: [],
-    collectibles: [],     // meshes, filled by missions.js pickup logic
-    sea: null, sun: null, hemi: null, skyMesh: null,
-    beacon: null, beaconLight: null,
-  };
+function windowsTexture(seed) {
+  const rng = makeRng(seed);
+  const c = document.createElement('canvas'); c.width = 64; c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffffff'; g.fillRect(0, 0, 64, 128);
+  for (let y = 6; y < 122; y += 12) {
+    for (let x = 6; x < 58; x += 12) {
+      const lit = rng.chance(0.45);
+      g.fillStyle = lit ? '#ffd76a' : '#20242c';
+      g.fillRect(x, y, 7, 8);
+    }
+  }
+  return new THREE.CanvasTexture(c);
+}
 
-  // --- Ground: one big slab, grass green inland, sand on the south beach.
+function makePalm(mat) {
+  const group = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.28, 4.4, 6), mat);
+  trunk.position.y = 2.2; group.add(trunk);
+  const leafMat = new THREE.MeshLambertMaterial({ color: 0x2e9e4f });
+  for (let i = 0; i < 5; i++) {
+    const leaf = new THREE.Mesh(new THREE.ConeGeometry(0.5, 2.6, 4), leafMat);
+    const a = (i / 5) * Math.PI * 2;
+    leaf.position.set(Math.cos(a) * 0.9, 4.6, Math.sin(a) * 0.9);
+    leaf.rotation.z = Math.cos(a) * 1.1; leaf.rotation.x = -Math.sin(a) * 1.1;
+    group.add(leaf);
+  }
+  return group;
+}
+
+export function buildWorld(G) {
+  const scene = G.scene;
+  const rng = makeRng(1337);
+  const world = { colliders: [], lights: [], shells: [], beacon: null, timeOfDay: 0.32 };
+  G.world = world;
+
+  scene.fog = new THREE.Fog(0xbfd9e8, 120, 520);
+
+  // Ground: city asphalt with painted markings, sand strip, sea.
   const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(760, 760),
-    new THREE.MeshLambertMaterial({ color: CONFIG.palette.grass }));
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.set(0, -0.05, 0);
-  scene.add(ground);
-
-  // South beach sand strip + the sea beyond it.
+    new THREE.PlaneGeometry(WORLD.SIZE, WORLD.SIZE),
+    new THREE.MeshLambertMaterial({ map: groundTexture() }),
+  );
+  ground.rotation.x = -Math.PI / 2; scene.add(ground);
   const sand = new THREE.Mesh(
-    new THREE.PlaneGeometry(760, 70),
-    new THREE.MeshLambertMaterial({ color: CONFIG.palette.sand }));
+    new THREE.PlaneGeometry(WORLD.SAND_X1 - WORLD.SAND_X0, WORLD.SIZE),
+    new THREE.MeshLambertMaterial({ color: 0xe8d29a }),
+  );
   sand.rotation.x = -Math.PI / 2;
-  sand.position.set(0, 0.0, -295);
+  sand.position.set((WORLD.SAND_X0 + WORLD.SAND_X1) / 2, 0.05, 0);
   scene.add(sand);
   const sea = new THREE.Mesh(
-    new THREE.PlaneGeometry(760, 120),
-    new THREE.MeshLambertMaterial({ color: CONFIG.palette.sea, transparent: true, opacity: 0.92 }));
+    new THREE.PlaneGeometry(60, WORLD.SIZE + 80),
+    new THREE.MeshLambertMaterial({ color: 0x1f7fa8, transparent: true, opacity: 0.92 }),
+  );
   sea.rotation.x = -Math.PI / 2;
-  sea.position.set(0, 0.15, -390);
+  sea.position.set(WORLD.WATER_X - 28, -0.4, 0);
   scene.add(sea);
-  world.sea = sea;
 
-  // --- Roads: a grid of dark asphalt strips with pale centre dashes.
-  const roadMat = new THREE.MeshLambertMaterial({ color: CONFIG.palette.road });
-  const half = CONFIG.cityHalf;
-  for (let c = -half; c <= half; c += CONFIG.roadSpacing) {
-    const roadX = new THREE.Mesh(new THREE.PlaneGeometry(CONFIG.roadWidth, half * 2 + 40), roadMat);
-    roadX.rotation.x = -Math.PI / 2; roadX.position.set(c, 0.02, 0);
-    scene.add(roadX);
-    const roadZ = new THREE.Mesh(new THREE.PlaneGeometry(half * 2 + 40, CONFIG.roadWidth), roadMat);
-    roadZ.rotation.x = -Math.PI / 2; roadZ.position.set(0, 0.02, c);
-    scene.add(roadZ);
-  }
-  // Centre dashes: two instanced meshes instead of ~1500 separate planes.
-  const dashAList = [];
-  const dashBList = [];
-  for (let c = -half; c <= half; c += CONFIG.roadSpacing) {
-    for (let d = -half; d <= half; d += 14) {
-      if (Math.abs(d - nearestRoadCoord(d)) < 4) continue; // skip intersections
-      dashAList.push({ x: c, y: 0.04, z: d, rx: -Math.PI / 2 });
-      dashBList.push({ x: d, y: 0.04, z: c, rx: -Math.PI / 2 });
-    }
-  }
-  const dashMat = new THREE.MeshBasicMaterial({ color: 0xd8d8c8 });
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(new THREE.PlaneGeometry(0.7, 4), dashMat, dashAList.length), dashAList));
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(new THREE.PlaneGeometry(4, 0.7), dashMat, dashBList.length), dashBList));
+  // Sun + sky light.
+  const sun = new THREE.DirectionalLight(0xfff2d0, 1.5);
+  sun.position.set(120, 180, 60); scene.add(sun);
+  const hemi = new THREE.HemisphereLight(0xbfd9ff, 0x3a3230, 0.9); scene.add(hemi);
+  world.sun = sun; world.hemi = hemi;
 
-  // --- Sidewalks: one instanced mesh of pale block frames.
-  const walkList = [];
-  for (let bx = -half; bx < half; bx += CONFIG.roadSpacing) {
-    for (let bz = -half; bz < half; bz += CONFIG.roadSpacing) {
-      const cx = bx + CONFIG.roadSpacing / 2;
-      const cz = bz + CONFIG.roadSpacing / 2;
-      if (cz < -245) continue; // beach: sand, not sidewalk
-      walkList.push({ x: cx, y: 0.01, z: cz, rx: -Math.PI / 2 });
-    }
-  }
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(
-      new THREE.PlaneGeometry(CONFIG.blockSize + 4, CONFIG.blockSize + 4),
-      new THREE.MeshLambertMaterial({ color: CONFIG.palette.sidewalk }),
-      walkList.length),
-    walkList));
-
-  // --- Buildings: one or two boxes per block, height by district.
+  // Buildings, parks and lots, one per block.
+  const winTex = [windowsTexture(11), windowsTexture(23)];
   const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-  const buildingList = [];
-  const buildingColors = [];
-  const roofList = [];
-  const windowList = [];
-  for (let bx = -half; bx < half; bx += CONFIG.roadSpacing) {
-    for (let bz = -half; bz < half; bz += CONFIG.roadSpacing) {
-      const cx = bx + CONFIG.roadSpacing / 2;
-      const cz = bz + CONFIG.roadSpacing / 2;
-      if (cz < -245) continue;                    // beach stays open
-      if (cx > 150 && cz > -40 && cz < 140) continue; // marina docks stay open
-      const d = districtAt(cx, cz) || { height: [10, 26], color: 0x999999 };
-      const count = rng() < 0.45 ? 1 : 2;
-      for (let i = 0; i < count; i++) {
-        const w = range(rng, 16, 26);
-        const dep = range(rng, 16, 26);
-        const h = range(rng, d.height[0], d.height[1]);
-        const ox = count === 1 ? 0 : (i === 0 ? -11 : 11);
-        const oz = count === 1 ? 0 : (i === 0 ? -11 : 11);
-        buildingList.push({ x: cx + ox, y: h / 2, z: cz + oz, sx: w, sy: h, sz: dep });
-        buildingColors.push(pick(rng, CONFIG.palette.building));
-        roofList.push({ x: cx + ox, y: h + 0.6, z: cz + oz, sx: w * 0.7, sy: 1.2, sz: dep * 0.7 });
-        // Lit window strip near the top, facing +z.
-        if (rng() < 0.7) {
-          windowList.push({ x: cx + ox, y: h * 0.72, z: cz + oz + dep / 2 + 0.06, sx: w * 0.8, sy: 1.1, sz: 1 });
+  const trunkMat = new THREE.MeshLambertMaterial({ color: 0x7a5230 });
+  const baseColors = [0xd8d3c8, 0xc9b8a3, 0xb8c4cc, 0xd9c1b8, 0xa8b8a0, 0xc4b49a];
+  for (let bx = -180; bx <= 240; bx += WORLD.ROAD_STEP) {
+    for (let bz = -240; bz <= 240; bz += WORLD.ROAD_STEP) {
+      if (bx < WORLD.CITY_MIN_X + 20) continue; // beach strip stays open
+      const d = districtAt(bx, bz);
+      const roll = rng.next();
+      if (roll < 0.16) {
+        // Park: grass + palms.
+        const grass = new THREE.Mesh(new THREE.PlaneGeometry(26, 26),
+          new THREE.MeshLambertMaterial({ color: 0x4f9e4a }));
+        grass.rotation.x = -Math.PI / 2; grass.position.set(bx, 0.08, bz); scene.add(grass);
+        for (let i = 0; i < 3; i++) {
+          const palm = makePalm(trunkMat);
+          palm.position.set(bx + rng.rand(-9, 9), 0, bz + rng.rand(-9, 9));
+          scene.add(palm);
         }
-        world.colliders.push({
-          x0: cx + ox - w / 2, x1: cx + ox + w / 2,
-          z0: cz + oz - dep / 2, z1: cz + oz + dep / 2,
-        });
+        continue;
+      }
+      if (roll < 0.3) continue; // open lot / parking
+      const w = rng.rand(12, 22), dep = rng.rand(12, 22);
+      const tall = d.id === 3 ? rng.rand(20, 44) : rng.rand(6, 22);
+      const tint = new THREE.Color(rng.pick(baseColors)).lerp(new THREE.Color(d.color), 0.22);
+      const mat = new THREE.MeshLambertMaterial({ color: tint, map: winTex[rng.randi(0, 1)] });
+      const b = new THREE.Mesh(boxGeo, mat);
+      b.scale.set(w, tall, dep);
+      b.position.set(bx, tall / 2, bz);
+      scene.add(b);
+      // Rooftop rim so towers read at dusk.
+      const rim = new THREE.Mesh(new THREE.BoxGeometry(w + 0.6, 0.5, dep + 0.6),
+        new THREE.MeshLambertMaterial({ color: 0x2c2f36 }));
+      rim.position.set(bx, tall + 0.2, bz); scene.add(rim);
+      world.colliders.push({ x0: bx - w / 2, z0: bz - dep / 2, x1: bx + w / 2, z1: bz + dep / 2 });
+    }
+  }
+
+  // Beach palms, pier, marina boats, port cranes.
+  for (let z = -240; z <= 240; z += 36) {
+    const palm = makePalm(trunkMat);
+    palm.position.set(-208 + rng.rand(-6, 6), 0, z + rng.rand(-6, 6));
+    scene.add(palm);
+  }
+  const pier = new THREE.Mesh(new THREE.BoxGeometry(46, 0.8, 8),
+    new THREE.MeshLambertMaterial({ color: 0x8a6b48 }));
+  pier.position.set(-232, 0.4, -180); scene.add(pier);
+  const boatMat = new THREE.MeshLambertMaterial({ color: 0xf2f2f2 });
+  for (let i = 0; i < 5; i++) {
+    const boat = new THREE.Group();
+    const hull = new THREE.Mesh(new THREE.BoxGeometry(9, 1.4, 3), boatMat);
+    hull.position.y = 0.2; boat.add(hull);
+    const cabin = new THREE.Mesh(new THREE.BoxGeometry(3, 1.6, 2.4),
+      new THREE.MeshLambertMaterial({ color: 0x2c6f8e }));
+    cabin.position.set(-1, 1.6, 0); boat.add(cabin);
+    boat.position.set(-268 - i * 2, -0.2, -140 + i * 52);
+    boat.rotation.y = rng.rand(-0.2, 0.2);
+    scene.add(boat);
+  }
+  const craneMat = new THREE.MeshLambertMaterial({ color: 0xe8a13a });
+  for (const [cx, cz] of [[200, 140], [230, 220]]) {
+    const crane = new THREE.Group();
+    const leg1 = new THREE.Mesh(new THREE.BoxGeometry(2, 34, 2), craneMat);
+    leg1.position.set(-6, 17, 0); crane.add(leg1);
+    const leg2 = leg1.clone(); leg2.position.x = 6; crane.add(leg2);
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(30, 2, 2), craneMat);
+    arm.position.set(4, 33, 0); crane.add(arm);
+    crane.position.set(cx, 0, cz); scene.add(crane);
+    world.colliders.push({ x0: cx - 8, z0: cz - 2, x1: cx + 8, z1: cz + 2 });
+  }
+
+  // Streetlights along the roads.
+  const poleMat = new THREE.MeshLambertMaterial({ color: 0x30343a });
+  const bulbMat = new THREE.MeshLambertMaterial({ color: 0xffe9a8, emissive: 0xffd76a, emissiveIntensity: 0 });
+  for (let v = -240; v <= 240; v += 80) {
+    for (let u = -240; u <= 240; u += 80) {
+      for (const [lx, lz] of [[v + 8, u], [v, u + 8]]) {
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 6, 6), poleMat);
+        pole.position.set(lx, 3, lz); scene.add(pole);
+        const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.35, 8, 6), bulbMat);
+        bulb.position.set(lx, 6.1, lz); scene.add(bulb);
+        world.lights.push(bulbMat);
       }
     }
   }
-  const buildingsMesh = fillInstances(
-    new THREE.InstancedMesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0xffffff }), buildingList.length),
-    buildingList, buildingColors);
-  scene.add(buildingsMesh);
-  world.buildings.push(buildingsMesh);
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(boxGeo, new THREE.MeshLambertMaterial({ color: 0x5a5f66 }), roofList.length),
-    roofList));
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: 0xffe9a8 }), windowList.length),
-    windowList));
 
-  // --- Marina docks + boats on the east edge.
-  const dockMat = new THREE.MeshLambertMaterial({ color: 0x7a5c3e });
-  for (let i = 0; i < 4; i++) {
-    const dock = new THREE.Mesh(boxGeo, dockMat);
-    dock.scale.set(26, 0.8, 5);
-    dock.position.set(265, 0.4, -20 + i * 30);
-    scene.add(dock);
-    const hull = new THREE.Mesh(boxGeo, new THREE.MeshLambertMaterial({ color: pick(rng, [0xe8e8e8, 0x3f6fb5, 0xc94f4f]) }));
-    hull.scale.set(14, 2.2, 4);
-    hull.position.set(258, 1.0, -8 + i * 30);
-    scene.add(hull);
-  }
-
-  // --- Palm trees along the beach and in the hills.
-  const trunkList = [];
-  const leafList = [];
-  for (let i = 0; i < 90; i++) {
-    const x = range(rng, -290, 290);
-    const z = rng() < 0.6 ? range(rng, -280, -250) : range(rng, 150, 290);
-    if (Math.abs(x - nearestRoadCoord(x)) < 10 || Math.abs(z - nearestRoadCoord(z)) < 10) continue;
-    trunkList.push({ x, y: 3, z });
-    leafList.push({ x, y: 8, z });
-    world.colliders.push({ x0: x - 0.6, x1: x + 0.6, z0: z - 0.6, z1: z + 0.6 });
-  }
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(new THREE.CylinderGeometry(0.35, 0.5, 6, 6),
-      new THREE.MeshLambertMaterial({ color: 0x7a5c3e }), trunkList.length),
-    trunkList));
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(new THREE.ConeGeometry(3.2, 4.5, 7),
-      new THREE.MeshLambertMaterial({ color: 0x3f7a3a }), leafList.length),
-    leafList));
-
-  // --- Streetlights along the roads (pole + glowing head, instanced).
-  const poleList = [];
-  const lampList = [];
-  for (let c = -half; c <= half; c += CONFIG.roadSpacing) {
-    for (let d = -half + 35; d <= half; d += CONFIG.roadSpacing) {
-      poleList.push({ x: c + 8, y: 3.5, z: d });
-      lampList.push({ x: c + 8, y: 7.1, z: d });
-    }
-  }
-  scene.add(fillInstances(
-    new THREE.InstancedMesh(new THREE.CylinderGeometry(0.18, 0.22, 7, 6),
-      new THREE.MeshLambertMaterial({ color: 0x3a3f45 }), poleList.length),
-    poleList));
-  const lampMesh = fillInstances(
-    new THREE.InstancedMesh(new THREE.SphereGeometry(0.55, 8, 6),
-      new THREE.MeshBasicMaterial({ color: 0xffe9a8 }), lampList.length),
-    lampList);
-  scene.add(lampMesh);
-  world.streetlights.push(lampMesh);
-
-  // --- Sky dome, sun and hemisphere light.
-  const skyGeo = new THREE.SphereGeometry(900, 24, 12);
-  const skyMat = new THREE.MeshBasicMaterial({
-    color: CONFIG.palette.skyDay, side: THREE.BackSide, fog: false,
-  });
-  const sky = new THREE.Mesh(skyGeo, skyMat);
-  scene.add(sky);
-  world.skyMesh = sky;
-  const sun = new THREE.DirectionalLight(CONFIG.palette.sunDay, 1.6);
-  sun.position.set(200, 300, 100);
-  scene.add(sun);
-  world.sun = sun;
-  const hemi = new THREE.HemisphereLight(0xbfd9ff, 0x5a6a4a, 1.05);
-  scene.add(hemi);
-  world.hemi = hemi;
-  // Fill light from the opposite side so faces turned away from the sun
-  // still read their colour instead of going flat grey.
-  const fill = new THREE.DirectionalLight(0xffe0b8, 0.55);
-  fill.position.set(0, 200, -300);
-  scene.add(fill);
-  world.fill = fill;
-  scene.fog = new THREE.Fog(0x9fc3e8, 220, 780);
-
-  // --- Mission beacon: a glowing column + point light, moved by missions.js.
-  const beaconMat = new THREE.MeshBasicMaterial({
-    color: 0xffc93c, transparent: true, opacity: 0.3, side: THREE.DoubleSide, depthWrite: false,
-  });
-  const beacon = new THREE.Mesh(new THREE.CylinderGeometry(1.8, 1.8, 60, 12, 1, true), beaconMat);
-  beacon.position.set(0, 30, 0);
-  beacon.visible = false;
-  scene.add(beacon);
-  const beaconLight = new THREE.PointLight(0xffc93c, 0, 90);
-  beaconLight.position.set(0, 8, 0);
-  scene.add(beaconLight);
+  // Mission beacon (moved by missions.js): a light pillar + ring on the ground.
+  const beacon = new THREE.Group();
+  const pillar = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.6, 1.6, 60, 12, 1, true),
+    new THREE.MeshBasicMaterial({ color: 0xffd23a, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false }),
+  );
+  pillar.position.y = 30; beacon.add(pillar);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(2.2, 3.2, 24),
+    new THREE.MeshBasicMaterial({ color: 0xffd23a, transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; ring.position.y = 0.15; beacon.add(ring);
+  beacon.visible = false; scene.add(beacon);
   world.beacon = beacon;
-  world.beaconLight = beaconLight;
 
-  world.setBeacon = (x, z, visible) => {
-    beacon.visible = visible;
-    beacon.position.set(x, 30, z);
-    beaconLight.position.set(x, 8, z);
-    beaconLight.intensity = visible ? 60 : 0;
-  };
-
+  // Hidden shells (collectibles) on sidewalks near roads.
+  const shellMat = new THREE.MeshLambertMaterial({ color: 0xff9ff3, emissive: 0xd63384, emissiveIntensity: 0.9 });
+  for (let i = 0; i < 30; i++) {
+    const x = rng.randi(-5, 5) * 40 + rng.rand(-6, 6);
+    const z = rng.randi(-5, 5) * 40 + rng.rand(-6, 6);
+    if (x < -195 || Math.abs(x) > 250 || Math.abs(z) > 250) { i--; continue; }
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.45, 10, 8), shellMat);
+    m.position.set(x, 0.7, z); scene.add(m);
+    world.shells.push({ mesh: m, x, z, taken: false });
+  }
   return world;
 }
 
-// Push a circle (x,z,r) out of every building collider it overlaps.
-// Returns true when a push happened.
-export function collideCircle(world, pos, r) {
-  let hit = false;
+// Push a circle (player / car) out of building colliders and the sea. Returns true if pushed.
+export function collideCircle(world, x, z, r) {
+  let pushed = false;
   for (const c of world.colliders) {
-    const nx = Math.max(c.x0, Math.min(pos.x, c.x1));
-    const nz = Math.max(c.z0, Math.min(pos.z, c.z1));
-    const dx = pos.x - nx;
-    const dz = pos.z - nz;
-    const d2 = dx * dx + dz * dz;
+    const nx = clamp(x, c.x0, c.x1), nz = clamp(z, c.z0, c.z1);
+    const dx = x - nx, dz = z - nz, d2 = dx * dx + dz * dz;
     if (d2 < r * r) {
-      hit = true;
-      if (d2 > 0.0001) {
+      if (d2 > 1e-6) {
         const d = Math.sqrt(d2);
-        pos.x = nx + (dx / d) * r;
-        pos.z = nz + (dz / d) * r;
+        x = nx + (dx / d) * r; z = nz + (dz / d) * r;
       } else {
-        // Centre inside the box: push out along the smallest penetration.
-        const pl = pos.x - c.x0 + r, pr = c.x1 - pos.x + r;
-        const pt = pos.z - c.z0 + r, pb = c.z1 - pos.z + r;
+        // Centre inside the box: shove out along the smallest penetration axis.
+        const pl = x - (c.x0 - r), pr = (c.x1 + r) - x, pt = z - (c.z0 - r), pb = (c.z1 + r) - z;
         const m = Math.min(pl, pr, pt, pb);
-        if (m === pl) pos.x = c.x0 - r;
-        else if (m === pr) pos.x = c.x1 + r;
-        else if (m === pt) pos.z = c.z0 - r;
-        else pos.z = c.z1 + r;
+        if (m === pl) x = c.x0 - r; else if (m === pr) x = c.x1 + r;
+        else if (m === pt) z = c.z0 - r; else z = c.z1 + r;
       }
+      pushed = true;
     }
   }
-  // City bounds: soft wall at the edge.
-  const b = CONFIG.cityHalf + 30;
-  pos.x = Math.max(-b, Math.min(b, pos.x));
-  pos.z = Math.max(-b - 60, Math.min(b, pos.z));
-  return hit;
+  if (x < WORLD.SAND_X0 + 2) { x = WORLD.SAND_X0 + 2; pushed = true; }
+  if (x > WORLD.HALF - 2) { x = WORLD.HALF - 2; pushed = true; }
+  if (z < -WORLD.HALF + 2) { z = -WORLD.HALF + 2; pushed = true; }
+  if (z > WORLD.HALF - 2) { z = WORLD.HALF - 2; pushed = true; }
+  return { x, z, pushed };
 }
 
-// Time of day: t in [0,1] — 0.0 dawn, 0.5 noon, 0.72 dusk, 0.95 night.
-export function applyTimeOfDay(world, t) {
-  const pal = CONFIG.palette;
-  const sky = new THREE.Color(pal.skyDay);
-  const sunCol = new THREE.Color(pal.sunDay);
-  let sunI = 1.9, hemiI = 1.25, fillI = 0.7;
-  if (t > 0.62 && t <= 0.85) {
-    const k = (t - 0.62) / 0.23; // day -> dusk
-    sky.lerp(new THREE.Color(pal.skyDusk), k);
-    sunCol.lerp(new THREE.Color(pal.sunDusk), k);
-    sunI = 1.9 - k * 0.5; hemiI = 1.25 - k * 0.3; fillI = 0.7 - k * 0.15;
-  } else if (t > 0.85) {
-    const k = Math.min(1, (t - 0.85) / 0.12); // dusk -> night
-    sky.copy(new THREE.Color(pal.skyDusk)).lerp(new THREE.Color(pal.skyNight), k);
-    sunCol.copy(new THREE.Color(pal.sunDusk)).lerp(new THREE.Color(pal.sunNight), k);
-    sunI = 1.4 - k * 0.7; hemiI = 0.95 - k * 0.3; fillI = 0.55 - k * 0.2;
-  }
-  world.skyMesh.material.color.copy(sky);
-  world.sun.color.copy(sunCol);
-  world.sun.intensity = sunI;
-  world.hemi.intensity = hemiI;
-  if (world.fill) world.fill.intensity = fillI;
-  world.sun.position.set(Math.cos(t * Math.PI * 2) * 300, 120 + Math.sin(t * Math.PI) * 220, 180);
-  if (world.sea) world.sea.material.color.setHex(t > 0.85 ? 0x0e2a44 : pal.sea);
-}
+export function districtOf(x, z) { return districtAt(x, z); }
 
-// Shared fog colour follows the sky so the horizon never looks wrong.
-export function syncFog(scene, world, t) {
-  const sky = world.skyMesh.material.color;
-  if (scene.fog) scene.fog.color.copy(sky);
-  scene.background = sky;
-}
-
-export function makeCollectibleMesh(x, z) {
-  const mesh = new THREE.Mesh(
-    new THREE.OctahedronGeometry(1.1, 0),
-    new THREE.MeshBasicMaterial({ color: 0xffd23c }),
-  );
-  mesh.position.set(x, 1.6, z);
-  return mesh;
+// t: 0..1 around the clock. 0.32 = day, 0.86 = dusk, 0.98 = night.
+export function setTimeOfDay(G, t) {
+  const w = G.world;
+  w.timeOfDay = t;
+  const day = 1 - clamp(Math.abs(t - 0.32) / 0.22, 0, 1);
+  const dusk = 1 - clamp(Math.abs(t - 0.86) / 0.1, 0, 1);
+  const night = t > 0.92 || t < 0.08 ? 1 : 0;
+  const sky = new THREE.Color(0xbfd9e8).lerp(new THREE.Color(0xff9a4d), dusk * 0.8);
+  if (night) sky.set(0x0e1626);
+  G.scene.background = sky;
+  G.scene.fog.color.copy(sky);
+  const sunH = Math.sin((0.5 - Math.abs(t - 0.5)) * Math.PI) * 0.9 + 0.1;
+  w.sun.position.set(120 * (1 - dusk), 40 + 160 * sunH * (1 - night * 0.85), 60);
+  w.sun.color.setHex(dusk > 0.4 ? 0xffb36b : 0xfff2d0);
+  w.sun.intensity = night ? 0.12 : 0.7 + 0.9 * day + 0.5 * dusk;
+  w.hemi.intensity = night ? 0.25 : 0.55 + 0.4 * day;
+  for (const m of w.lights) m.emissiveIntensity = (dusk > 0.3 || night) ? 1.6 : 0;
 }
